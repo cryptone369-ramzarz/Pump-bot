@@ -1,13 +1,6 @@
 /**
  * پامپ‌یاب لحظه‌ای — رصد رشد کوتاه‌مدت قیمت رمزارزها (از CoinGecko)
  * و اطلاع‌رسانی از طریق ربات تلگرام (حتی وقتی اپ/مرورگر بسته باشه).
- *
- * توجه: نسخه‌ی قبلی از وب‌ساکت بایننس استفاده می‌کرد، ولی بایننس دسترسی
- * خیلی از سرورهای ابری (Railway/Render/AWS و...) رو مسدود می‌کنه (خطای 451).
- * این نسخه به‌جاش از CoinGecko استفاده می‌کنه که این محدودیت رو نداره.
- *
- * این اسکریپت باید روی یه سرور همیشه‌روشن اجرا بشه (نه روی گوشی)،
- * چون کارش رصد دائمی بازاره. راهنمای دیپلوی در README.md هست.
  */
 
 // ---------------- تنظیمات (از متغیرهای محیطی) ----------------
@@ -16,8 +9,9 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const THRESHOLD_PERCENT  = parseFloat(process.env.THRESHOLD_PERCENT || "5");
 const WINDOW_MINUTES     = parseFloat(process.env.WINDOW_MINUTES || "5");
 const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5");
-const POLL_SECONDS       = parseFloat(process.env.POLL_SECONDS || "20");
-const PAGES              = parseInt(process.env.PAGES || "2", 10);
+const POLL_SECONDS       = parseFloat(process.env.POLL_SECONDS || "40");
+const PAGES              = parseInt(process.env.PAGES || "1", 10);
+const COINGECKO_API_KEY  = process.env.COINGECKO_API_KEY || "";
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error("خطا: TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID رو به‌عنوان متغیر محیطی تنظیم کن (راهنما در README.md).");
@@ -40,9 +34,14 @@ function sendTelegram(text) {
   }).catch((err) => console.error("خطا در ارسال پیام تلگرام:", err.message));
 }
 
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 async function fetchMarketsPage(page) {
   const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}&sparkline=false`;
-  const res = await fetch(url);
+  const headers = {};
+  if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
+  const res = await fetch(url, { headers });
+  if (res.status === 429) throw new Error("rate_limited_429");
   if (!res.ok) throw new Error("coingecko_failed_" + res.status);
   return res.json();
 }
@@ -87,6 +86,8 @@ function evaluate(now) {
   }
 }
 
+let consecutiveRateLimits = 0;
+
 async function pollOnce() {
   const now = Date.now();
   try {
@@ -97,10 +98,20 @@ async function pollOnce() {
         meta.set(c.id, { name: c.name, symbol: c.symbol });
         pushPrice(c.id, c.current_price, now);
       }
+      if (p < PAGES) await sleep(2000); // فاصله بین صفحات برای کاهش فشار
     }
     evaluate(now);
+    if (consecutiveRateLimits > 0) {
+      console.log("اتصال به CoinGecko دوباره برقرار شد.");
+    }
+    consecutiveRateLimits = 0;
   } catch (err) {
-    console.error("خطا در دریافت اطلاعات بازار:", err.message);
+    if (err.message === "rate_limited_429") {
+      consecutiveRateLimits++;
+      console.error(`محدودیت نرخ CoinGecko (429) — تلاش شماره ${consecutiveRateLimits}. کمی صبر می‌کنیم...`);
+    } else {
+      console.error("خطا در دریافت اطلاعات بازار:", err.message);
+    }
   }
 }
 
@@ -108,7 +119,7 @@ let started = false;
 function startPolling() {
   if (started) return;
   started = true;
-  console.log("شروع رصد بازار از CoinGecko...");
+  console.log("شروع رصد بازار از CoinGecko..." + (COINGECKO_API_KEY ? " (با کلید API)" : " (بدون کلید API)"));
   sendTelegram(`✅ پامپ‌یاب فعال شد. آستانه: ${THRESHOLD_PERCENT}٪ در ${WINDOW_MINUTES} دقیقه.`);
   pollOnce();
   setInterval(pollOnce, POLL_SECONDS * 1000);
