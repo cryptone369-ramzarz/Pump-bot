@@ -1,20 +1,23 @@
 /**
- * پامپ‌یاب لحظه‌ای — رصد رشد کوتاه‌مدت قیمت رمزارزها از بایننس
+ * پامپ‌یاب لحظه‌ای — رصد رشد کوتاه‌مدت قیمت رمزارزها (از CoinGecko)
  * و اطلاع‌رسانی از طریق ربات تلگرام (حتی وقتی اپ/مرورگر بسته باشه).
+ *
+ * توجه: نسخه‌ی قبلی از وب‌ساکت بایننس استفاده می‌کرد، ولی بایننس دسترسی
+ * خیلی از سرورهای ابری (Railway/Render/AWS و...) رو مسدود می‌کنه (خطای 451).
+ * این نسخه به‌جاش از CoinGecko استفاده می‌کنه که این محدودیت رو نداره.
  *
  * این اسکریپت باید روی یه سرور همیشه‌روشن اجرا بشه (نه روی گوشی)،
  * چون کارش رصد دائمی بازاره. راهنمای دیپلوی در README.md هست.
  */
 
-const WebSocket = require("ws");
-
 // ---------------- تنظیمات (از متغیرهای محیطی) ----------------
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
-const THRESHOLD_PERCENT  = parseFloat(process.env.THRESHOLD_PERCENT || "5");   // آستانه‌ی پامپ
-const WINDOW_MINUTES     = parseFloat(process.env.WINDOW_MINUTES || "5");     // بازه‌ی زمانی رشد
-const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5"); // برای جلوگیری از اسپم
-const QUOTE_SUFFIX       = process.env.QUOTE_SUFFIX || "USDT"; // فقط جفت‌های این ارز رصد بشه
+const THRESHOLD_PERCENT  = parseFloat(process.env.THRESHOLD_PERCENT || "5");
+const WINDOW_MINUTES     = parseFloat(process.env.WINDOW_MINUTES || "5");
+const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5");
+const POLL_SECONDS       = parseFloat(process.env.POLL_SECONDS || "20");
+const PAGES              = parseInt(process.env.PAGES || "2", 10);
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error("خطا: TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID رو به‌عنوان متغیر محیطی تنظیم کن (راهنما در README.md).");
@@ -22,15 +25,11 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 const WINDOW_MS = WINDOW_MINUTES * 60 * 1000;
-const BUFFER_MS = WINDOW_MS + 30 * 1000; // کمی بیشتر از بازه، برای دقت بهتر در پیدا کردن قیمت پایه
+const BUFFER_MS = WINDOW_MS + POLL_SECONDS * 1000 * 2;
 
-// symbol -> [{t, p}, ...]  (تاریخچه‌ی قیمت هر نماد، فقط داخل بازه‌ی زمانی نگه داشته می‌شه)
 const history = new Map();
-// symbol -> bool  (آیا الان بالای آستانه هست و قبلاً اطلاع داده شده)
 const notified = new Map();
-
-let lastEvalAt = 0;
-const EVAL_INTERVAL_MS = 15000; // هر ۱۵ ثانیه یک‌بار بررسی می‌کنیم (نه هر تیک، برای کاهش بار)
+const meta = new Map();
 
 function sendTelegram(text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -41,21 +40,26 @@ function sendTelegram(text) {
   }).catch((err) => console.error("خطا در ارسال پیام تلگرام:", err.message));
 }
 
-function pushPrice(symbol, price, now) {
-  let arr = history.get(symbol);
+async function fetchMarketsPage(page) {
+  const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}&sparkline=false`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("coingecko_failed_" + res.status);
+  return res.json();
+}
+
+function pushPrice(id, price, now) {
+  let arr = history.get(id);
   if (!arr) {
     arr = [];
-    history.set(symbol, arr);
+    history.set(id, arr);
   }
   arr.push({ t: now, p: price });
-  // حذف داده‌های قدیمی‌تر از بافر
   while (arr.length && now - arr[0].t > BUFFER_MS) arr.shift();
 }
 
 function evaluate(now) {
-  for (const [symbol, arr] of history.entries()) {
+  for (const [id, arr] of history.entries()) {
     if (arr.length < 2) continue;
-    // قدیمی‌ترین نقطه‌ای که حداقل به اندازه‌ی بازه‌ی موردنظر عقب‌تره (تقریبی)
     let base = arr[0];
     for (let i = 0; i < arr.length; i++) {
       if (now - arr[i].t <= WINDOW_MS) { base = arr[i]; break; }
@@ -65,69 +69,56 @@ function evaluate(now) {
     if (!base || base.p <= 0) continue;
     const changePct = ((latest.p - base.p) / base.p) * 100;
 
-    const wasNotified = notified.get(symbol) || false;
+    const wasNotified = notified.get(id) || false;
     if (changePct >= THRESHOLD_PERCENT) {
       if (!wasNotified) {
-        notified.set(symbol, true);
-        const name = symbol.replace(QUOTE_SUFFIX, "");
+        notified.set(id, true);
+        const m = meta.get(id) || { name: id, symbol: id };
         sendTelegram(
-          `🚀 پامپ شناسایی شد: ${name}\n` +
+          `🚀 پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})\n` +
           `رشد ${changePct.toFixed(1)}٪ در ${WINDOW_MINUTES} دقیقه‌ی اخیر\n` +
-          `قیمت فعلی: ${latest.p}`
+          `قیمت فعلی: $${latest.p}`
         );
-        console.log(`[ALERT] ${symbol} +${changePct.toFixed(2)}%`);
+        console.log(`[ALERT] ${m.symbol.toUpperCase()} +${changePct.toFixed(2)}%`);
       }
     } else if (changePct < THRESHOLD_PERCENT - HYSTERESIS_PERCENT) {
-      notified.set(symbol, false);
+      notified.set(id, false);
     }
   }
 }
 
-function connect() {
-  console.log("در حال اتصال به بایننس...");
-  const ws = new WebSocket("wss://stream.binance.com:9443/ws/!miniTicker@arr");
-
-  ws.on("open", () => {
-    console.log("متصل شد. شروع رصد بازار...");
-    sendTelegram(`✅ پامپ‌یاب فعال شد. آستانه: ${THRESHOLD_PERCENT}٪ در ${WINDOW_MINUTES} دقیقه.`);
-  });
-
-  ws.on("message", (raw) => {
-    let list;
-    try { list = JSON.parse(raw); } catch (e) { return; }
-    if (!Array.isArray(list)) return;
-    const now = Date.now();
-    for (const t of list) {
-      const symbol = t.s; // مثل BTCUSDT
-      if (!symbol || !symbol.endsWith(QUOTE_SUFFIX)) continue;
-      const price = parseFloat(t.c);
-      if (!price) continue;
-      pushPrice(symbol, price, now);
+async function pollOnce() {
+  const now = Date.now();
+  try {
+    for (let p = 1; p <= PAGES; p++) {
+      const coins = await fetchMarketsPage(p);
+      for (const c of coins) {
+        if (!c.current_price) continue;
+        meta.set(c.id, { name: c.name, symbol: c.symbol });
+        pushPrice(c.id, c.current_price, now);
+      }
     }
-    if (now - lastEvalAt >= EVAL_INTERVAL_MS) {
-      lastEvalAt = now;
-      evaluate(now);
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("اتصال قطع شد. تلاش مجدد در ۵ ثانیه...");
-    setTimeout(connect, 5000);
-  });
-
-  ws.on("error", (err) => {
-    console.error("خطای اتصال:", err.message);
-    ws.close();
-  });
+    evaluate(now);
+  } catch (err) {
+    console.error("خطا در دریافت اطلاعات بازار:", err.message);
+  }
 }
 
-connect();
+let started = false;
+function startPolling() {
+  if (started) return;
+  started = true;
+  console.log("شروع رصد بازار از CoinGecko...");
+  sendTelegram(`✅ پامپ‌یاب فعال شد. آستانه: ${THRESHOLD_PERCENT}٪ در ${WINDOW_MINUTES} دقیقه.`);
+  pollOnce();
+  setInterval(pollOnce, POLL_SECONDS * 1000);
+}
 
-// یه سرور HTTP خیلی ساده فقط برای اینکه پلتفرم‌های میزبانی (Railway/Render)
-// تشخیص بدن که سرویس زنده‌ست (بعضی‌هاشون به یه پورت باز نیاز دارن).
+startPolling();
+
 const http = require("http");
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-  res.end("پامپ‌یاب در حال اجراست.\nنمادهای تحت رصد: " + history.size);
+  res.end("پامپ‌یاب در حال اجراست.\nکوین‌های تحت رصد: " + history.size);
 }).listen(PORT, () => console.log("سرور وضعیت روی پورت " + PORT + " بالا اومد."));
