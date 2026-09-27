@@ -1,14 +1,15 @@
 /**
  * پامپ‌یاب حرفه‌ای — نسخه‌ی کامل
  * رصد رشد/افت کوتاه‌مدت قیمت رمزارزها (از CoinGecko)، فیلتر نقدینگی،
- * چند بازه‌ی زمانی هم‌زمان، امتیاز اطمینان، لیست سیاه/سفید، تاریخچه،
- * ذخیره‌ی تنظیمات، لینک نمودار، و کنترل زنده از تلگرام.
+ * چند بازه‌ی زمانی هم‌زمان، امتیاز اطمینان (+ تأیید روند ۴ ساعته)،
+ * لیست سیاه/سفید، تاریخچه، بک‌تست ساده، دکمه‌های شیشه‌ای تلگرام،
+ * ذخیره‌ی تنظیمات، و کنترل زنده از تلگرام.
  */
 
 const fs = require("fs");
 const path = require("path");
 
-// ---------------- تنظیمات پایه (از متغیرهای محیطی) ----------------
+// ---------------- تنظیمات پایه ----------------
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5");
@@ -30,25 +31,19 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 
 // ---------------- حالت قابل‌تغییر + ذخیره‌سازی ----------------
 const STATE_FILE = path.join(__dirname, "state.json");
-
 let state = {
   threshold: parseFloat(process.env.THRESHOLD_PERCENT || "5"),
   dumpThreshold: -Math.abs(parseFloat(process.env.DUMP_THRESHOLD_PERCENT || "5")),
   paused: false,
-  watchlist: [],             // [{id, symbol, name}]
+  watchlist: [],
   blacklist: DEFAULT_BLACKLIST.concat(ENV_BLACKLIST),
-  history: [],               // [{t, type, symbol, name, detail}]
+  history: [], // [{t, type, symbol, name, detail, id, price}]
 };
-
 function loadState() {
   try {
-    const raw = fs.readFileSync(STATE_FILE, "utf8");
-    const saved = JSON.parse(raw);
-    state = Object.assign(state, saved);
+    state = Object.assign(state, JSON.parse(fs.readFileSync(STATE_FILE, "utf8")));
     console.log("تنظیمات قبلی از فایل بارگذاری شد.");
-  } catch (e) {
-    console.log("فایل تنظیمات قبلی پیدا نشد؛ از مقادیر پیش‌فرض استفاده می‌شه.");
-  }
+  } catch (e) { console.log("فایل تنظیمات قبلی پیدا نشد؛ از مقادیر پیش‌فرض استفاده می‌شه."); }
 }
 function saveState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
@@ -56,8 +51,8 @@ function saveState() {
 }
 loadState();
 
-const history = new Map();       // id -> [{t,p}, ...]  (قیمت‌های اخیر)
-const meta = new Map();          // id -> {name, symbol, volume, rank, marketCap}
+const history = new Map();
+const meta = new Map();
 const notifiedPump = new Map();
 const notifiedDump = new Map();
 
@@ -76,37 +71,77 @@ function fmtNum(n) {
 }
 function chartLink(id) { return `https://www.coingecko.com/en/coins/${id}`; }
 
-function sendTelegram(text) {
+function sendTelegram(text, keyboard) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const body = { chat_id: TELEGRAM_CHAT_ID, text: text };
+  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => console.error("خطا در ارسال پیام تلگرام:", err.message));
+}
+function answerCallback(id, text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
   fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text }),
-  }).catch((err) => console.error("خطا در ارسال پیام تلگرام:", err.message));
+    body: JSON.stringify({ callback_query_id: id, text: text, show_alert: false }),
+  }).catch(() => {});
+}
+
+// ---------------- تأیید روند ۴ ساعته ----------------
+async function fetchOHLC4h(id) {
+  const url = `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=7`;
+  const headers = {};
+  if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error("ohlc_failed_" + res.status);
+  return res.json(); // [[time, open, high, low, close], ...] هر کندل تقریباً ۴ ساعته‌ست
+}
+async function trendConfirmation(id, direction) {
+  try {
+    const candles = await fetchOHLC4h(id);
+    if (!candles || candles.length < 2) return { known: false };
+    const last2 = candles.slice(-2);
+    const bullish = last2.every((c) => c[4] > c[1]);
+    const bearish = last2.every((c) => c[4] < c[1]);
+    if (direction === "up") return { known: true, aligned: bullish, opposite: bearish };
+    return { known: true, aligned: bearish, opposite: bullish };
+  } catch (e) {
+    return { known: false };
+  }
 }
 
 // ---------------- امتیاز اطمینان ----------------
-function confidenceScore(m, changeAbs) {
+function confidenceScore(m, changeAbs, trend) {
   let score = 0;
-  if (m.volume >= MIN_VOLUME_USD * 5) score += 30;
-  else if (m.volume >= MIN_VOLUME_USD * 2) score += 15;
+  if (m.volume >= MIN_VOLUME_USD * 5) score += 25;
+  else if (m.volume >= MIN_VOLUME_USD * 2) score += 12;
 
-  if (m.rank && m.rank <= 100) score += 30;
-  else if (m.rank && m.rank <= 300) score += 15;
+  if (m.rank && m.rank <= 100) score += 25;
+  else if (m.rank && m.rank <= 300) score += 12;
   else if (m.rank && m.rank <= 500) score += 5;
 
   if (m.marketCap && m.marketCap > 0) {
     const turnover = m.volume / m.marketCap;
-    if (turnover > 0.15) score += 20;
-    else if (turnover > 0.07) score += 10;
+    if (turnover > 0.15) score += 15;
+    else if (turnover > 0.07) score += 8;
   }
 
-  if (changeAbs >= 5 && changeAbs <= 25) score += 20;
-  else if (changeAbs > 25) score += 8; // رشد/افت خیلی افراطی می‌تونه نشونه‌ی خطای داده هم باشه
+  if (changeAbs >= 5 && changeAbs <= 25) score += 15;
+  else if (changeAbs > 25) score += 6;
+
+  let trendLine = "روند ۴ ساعته: نامشخص";
+  if (trend && trend.known) {
+    if (trend.aligned) { score += 20; trendLine = "روند ۴ ساعته: هم‌جهت ✅"; }
+    else if (trend.opposite) { score -= 10; trendLine = "روند ۴ ساعته: مخالف ⚠️"; }
+    else trendLine = "روند ۴ ساعته: مبهم";
+  }
 
   score = Math.max(0, Math.min(100, score));
   const label = score >= 70 ? "قوی 🟢" : score >= 40 ? "متوسط 🟡" : "ضعیف 🔴";
-  return { score, label };
+  return { score, label, trendLine };
 }
 
 // ---------------- دریافت داده‌ی بازار ----------------
@@ -164,15 +199,14 @@ function computeChanges(arr, now) {
   }
   return changes;
 }
-
-function pushHistoryLog(type, symbol, name, detail) {
-  state.history.unshift({ t: Date.now(), type, symbol, name, detail });
-  if (state.history.length > 30) state.history.length = 30;
+function pushHistoryLog(type, symbol, name, detail, id, price) {
+  state.history.unshift({ t: Date.now(), type, symbol, name, detail, id, price });
+  if (state.history.length > 60) state.history.length = 60;
   saveState();
 }
 
 // ---------------- ارزیابی و اطلاع‌رسانی ----------------
-function evaluate(now) {
+async function evaluate(now) {
   const watchIds = new Set(state.watchlist.map((w) => w.id));
   for (const [id, arr] of history.entries()) {
     if (arr.length < 2) continue;
@@ -189,46 +223,48 @@ function evaluate(now) {
     const minChange = Math.min.apply(null, vals);
     const latestPrice = arr[arr.length - 1].p;
 
-    // --- پامپ ---
     const pumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] >= state.threshold);
     const wasPump = notifiedPump.get(id) || false;
     if (pumpWindows.length) {
       if (!wasPump) {
         notifiedPump.set(id, true);
-        const conf = confidenceScore(m, maxChange);
+        const trend = await trendConfirmation(id, "up");
+        const conf = confidenceScore(m, maxChange, trend);
         const lines = pumpWindows.map((w) => `${w} دقیقه: +${changes[w].toFixed(1)}٪`).join("\n");
         const label = `${m.symbol.toUpperCase()} +${maxChange.toFixed(1)}٪`;
         sendTelegram(
-          `🚀 پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐ (واچ‌لیست)" : ""}\n${lines}\n` +
+          `🚀 پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
           `قیمت فعلی: $${latestPrice}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
-          `اطمینان: ${conf.label} (${conf.score}/100)\n` +
-          `نمودار: ${chartLink(id)}`
+          `${conf.trendLine}\n` +
+          `اطمینان: ${conf.label} (${conf.score}/100)`,
+          [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
         );
-        pushHistoryLog("پامپ", m.symbol.toUpperCase(), m.name, label);
+        pushHistoryLog("پامپ", m.symbol.toUpperCase(), m.name, label, id, latestPrice);
         console.log(`[PUMP] ${label}`);
       }
     } else if (maxChange < state.threshold - HYSTERESIS_PERCENT) {
       notifiedPump.set(id, false);
     }
 
-    // --- دامپ ---
     const dumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] <= state.dumpThreshold);
     const wasDump = notifiedDump.get(id) || false;
     if (dumpWindows.length) {
       if (!wasDump) {
         notifiedDump.set(id, true);
-        const conf = confidenceScore(m, Math.abs(minChange));
+        const trend = await trendConfirmation(id, "down");
+        const conf = confidenceScore(m, Math.abs(minChange), trend);
         const lines = dumpWindows.map((w) => `${w} دقیقه: ${changes[w].toFixed(1)}٪`).join("\n");
         const label = `${m.symbol.toUpperCase()} ${minChange.toFixed(1)}٪`;
         sendTelegram(
-          `🔻 افت شدید: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐ (واچ‌لیست)" : ""}\n${lines}\n` +
+          `🔻 افت شدید: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
           `قیمت فعلی: $${latestPrice}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
-          `اطمینان: ${conf.label} (${conf.score}/100)\n` +
-          `نمودار: ${chartLink(id)}`
+          `${conf.trendLine}\n` +
+          `اطمینان: ${conf.label} (${conf.score}/100)`,
+          [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
         );
-        pushHistoryLog("دامپ", m.symbol.toUpperCase(), m.name, label);
+        pushHistoryLog("دامپ", m.symbol.toUpperCase(), m.name, label, id, latestPrice);
         console.log(`[DUMP] ${label}`);
       }
     } else if (minChange > state.dumpThreshold + HYSTERESIS_PERCENT) {
@@ -251,7 +287,6 @@ async function pollOnce() {
       }
       if (p < PAGES) await sleep(2000);
     }
-    // کوین‌های واچ‌لیست که ممکنه توی صفحات بالا نبوده باشن
     const missing = state.watchlist.map((w) => w.id).filter((id) => !meta.has(id));
     if (missing.length) {
       await sleep(1200);
@@ -261,7 +296,7 @@ async function pollOnce() {
         pushPrice(c.id, c.current_price, now);
       }
     }
-    evaluate(now);
+    await evaluate(now);
     lastPollAt = now;
     if (downAlertSent) sendTelegram("✅ اتصال به بازار دوباره برقرار شد.");
     consecutiveErrors = 0;
@@ -277,7 +312,40 @@ async function pollOnce() {
   }
 }
 
-// ---------------- دستورات تلگرام ----------------
+// ---------------- بک‌تست ساده (بر اساس هشدارهای واقعی گذشته) ----------------
+async function backtestReport(days) {
+  const cutoff = Date.now() - days * 86400000;
+  const relevant = state.history.filter((h) => h.t >= cutoff && h.id && h.price);
+  if (!relevant.length) return "هشدار کافی برای بک‌تست توی این بازه ثبت نشده. (این بک‌تست فقط روی هشدارهای واقعی خودت کار می‌کنه، نه شبیه‌سازی کامل بازار)";
+  const ids = Array.from(new Set(relevant.map((h) => h.id)));
+  let currentPrices = {};
+  try {
+    const data = await fetchMarketsByIds(ids);
+    for (const c of data) currentPrices[c.id] = c.current_price;
+  } catch (e) {
+    return "خطا در دریافت قیمت فعلی برای بک‌تست. دوباره امتحان کن.";
+  }
+
+  let pumpTotal = 0, pumpContinued = 0;
+  let dumpTotal = 0, dumpContinued = 0;
+  for (const h of relevant) {
+    const now = currentPrices[h.id];
+    if (now == null) continue;
+    const outcomePct = ((now - h.price) / h.price) * 100;
+    if (h.type === "پامپ") { pumpTotal++; if (outcomePct > 0) pumpContinued++; }
+    else if (h.type === "دامپ") { dumpTotal++; if (outcomePct < 0) dumpContinued++; }
+  }
+  const pumpRate = pumpTotal ? ((pumpContinued / pumpTotal) * 100).toFixed(0) : "—";
+  const dumpRate = dumpTotal ? ((dumpContinued / dumpTotal) * 100).toFixed(0) : "—";
+  return (
+    `📈 بک‌تست ${days} روز اخیر (بر اساس هشدارهای واقعی ثبت‌شده)\n\n` +
+    `پامپ‌ها: ${pumpTotal} مورد — ${pumpRate}٪ تا الان همچنان بالاتر از قیمت هشدار موندن\n` +
+    `دامپ‌ها: ${dumpTotal} مورد — ${dumpRate}٪ تا الان همچنان پایین‌تر از قیمت هشدار موندن\n\n` +
+    `توجه: این یه شبیه‌سازی کامل بازار نیست، فقط عملکرد واقعی هشدارهایی که خودت گرفتی رو نشون می‌ده.`
+  );
+}
+
+// ---------------- دستورات و دکمه‌های تلگرام ----------------
 let telegramOffset = 0;
 
 function helpText() {
@@ -287,13 +355,14 @@ function helpText() {
     "/dumpthreshold <عدد> — تغییر آستانه‌ی افت (٪)\n" +
     "/pause — توقف موقت رصد\n" +
     "/resume — از سرگیری رصد\n" +
-    "/watch <SYMBOL> — اضافه‌کردن کوین به واچ‌لیست (بدون فیلتر حجم)\n" +
+    "/watch <SYMBOL> — اضافه‌کردن به واچ‌لیست\n" +
     "/unwatch <SYMBOL> — حذف از واچ‌لیست\n" +
     "/watchlist — نمایش واچ‌لیست\n" +
     "/blacklist <SYMBOL> — نادیده‌گرفتن یه کوین\n" +
     "/unblacklist <SYMBOL> — حذف از لیست سیاه\n" +
     "/blacklistshow — نمایش لیست سیاه\n" +
     "/history — آخرین هشدارها\n" +
+    "/backtest <روز> — عملکرد واقعی هشدارهای گذشته (پیش‌فرض ۷ روز)\n" +
     "/help — همین راهنما";
 }
 function statusText() {
@@ -312,7 +381,6 @@ function historyText() {
     return `${icon} ${h.detail} — ${time}`;
   }).join("\n");
 }
-
 async function resolveSymbolToId(symbolRaw) {
   const symbol = symbolRaw.toUpperCase();
   for (const [id, m] of meta.entries()) {
@@ -330,7 +398,13 @@ async function handleCommand(text) {
   if (cmd === "/status") { sendTelegram(statusText()); return; }
   if (cmd === "/help" || cmd === "/start") { sendTelegram(helpText()); return; }
   if (cmd === "/history") { sendTelegram(historyText()); return; }
-
+  if (cmd === "/backtest") {
+    const days = parseFloat(parts[1]) || 7;
+    sendTelegram("در حال محاسبه‌ی بک‌تست...");
+    const report = await backtestReport(days);
+    sendTelegram(report);
+    return;
+  }
   if (cmd === "/threshold") {
     const v = parseFloat(parts[1]);
     if (!isNaN(v) && v > 0) { state.threshold = v; saveState(); sendTelegram(`✅ آستانه‌ی پامپ روی ${v}٪ تنظیم شد.`); }
@@ -352,7 +426,7 @@ async function handleCommand(text) {
     if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
     if (!state.watchlist.some((w) => w.id === found.id)) {
       state.watchlist.push(found); saveState();
-      sendTelegram(`⭐ ${found.symbol.toUpperCase()} به واچ‌لیست اضافه شد (بدون فیلتر حجم رصد می‌شه).`);
+      sendTelegram(`⭐ ${found.symbol.toUpperCase()} به واچ‌لیست اضافه شد.`);
     } else sendTelegram("این کوین از قبل توی واچ‌لیسته.");
     return;
   }
@@ -369,7 +443,6 @@ async function handleCommand(text) {
     sendTelegram(state.watchlist.length ? "⭐ واچ‌لیست:\n" + state.watchlist.map((w) => w.symbol.toUpperCase()).join("، ") : "واچ‌لیست خالیه.");
     return;
   }
-
   if (cmd === "/blacklist") {
     if (!parts[1]) { sendTelegram("مثال: /blacklist DOGE"); return; }
     const found = await resolveSymbolToId(parts[1]);
@@ -388,9 +461,18 @@ async function handleCommand(text) {
     sendTelegram(state.blacklist.length < before ? `${found.symbol.toUpperCase()} از لیست سیاه حذف شد.` : "این کوین توی لیست سیاه نبود.");
     return;
   }
-  if (cmd === "/blacklistshow") {
-    sendTelegram("🚫 لیست سیاه:\n" + state.blacklist.join("، "));
-    return;
+  if (cmd === "/blacklistshow") { sendTelegram("🚫 لیست سیاه:\n" + state.blacklist.join("، ")); return; }
+}
+
+async function handleCallback(cq) {
+  const data = cq.data || "";
+  if (data.startsWith("blacklist:")) {
+    const id = data.slice("blacklist:".length);
+    if (!state.blacklist.includes(id)) { state.blacklist.push(id); saveState(); }
+    const m = meta.get(id);
+    answerCallback(cq.id, (m ? m.symbol.toUpperCase() : id) + " مسدود شد ✅");
+  } else {
+    answerCallback(cq.id, "دستور ناشناخته");
   }
 }
 
@@ -402,6 +484,12 @@ async function pollTelegramCommands() {
     if (!data.ok || !Array.isArray(data.result)) return;
     for (const upd of data.result) {
       telegramOffset = upd.update_id + 1;
+      if (upd.callback_query) {
+        const cq = upd.callback_query;
+        if (String(cq.message.chat.id) !== String(TELEGRAM_CHAT_ID)) continue;
+        await handleCallback(cq);
+        continue;
+      }
       const msg = upd.message;
       if (!msg || !msg.text) continue;
       if (String(msg.chat.id) !== String(TELEGRAM_CHAT_ID)) continue;
@@ -427,7 +515,6 @@ function start() {
   setInterval(pollOnce, POLL_SECONDS * 1000);
   setInterval(pollTelegramCommands, 4000);
 }
-
 start();
 
 const http = require("http");
