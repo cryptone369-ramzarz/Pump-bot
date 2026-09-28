@@ -74,6 +74,10 @@ function fmtNum(n) {
 }
 function fmtDateTime(ts) { return new Date(ts).toLocaleString("fa-IR", { timeZone: TIMEZONE }); }
 function fmtTimeOnly(ts) { return new Date(ts).toLocaleTimeString("fa-IR", { timeZone: TIMEZONE }); }
+const PUMP_ICON1 = "🌲"; // آیکون فشرده (لیست‌ها، دکمه‌ها، تاریخچه)
+const DUMP_ICON1 = "🔻";
+const PUMP_ICON = PUMP_ICON1.repeat(3); // آیکون درشت (هدر و خطوط اصلی هشدار پامپ/دامپ)
+const DUMP_ICON = DUMP_ICON1.repeat(3);
 function chartLink(id) { return `https://www.coingecko.com/en/coins/${id}`; }
 function fmtPrice(p) {
   if (p == null || isNaN(p)) return "—";
@@ -241,10 +245,10 @@ async function evaluate(now) {
         notifiedPump.set(id, true);
         const trend = await trendConfirmation(id, "up");
         const conf = confidenceScore(m, maxChange, trend);
-        const lines = pumpWindows.map((w) => `${w} دقیقه: +${changes[w].toFixed(1)}٪`).join("\n");
+        const lines = pumpWindows.map((w) => `${PUMP_ICON} ${w} دقیقه: +${changes[w].toFixed(1)}٪`).join("\n");
         const label = `${m.symbol.toUpperCase()} +${maxChange.toFixed(1)}٪`;
         sendTelegram(
-          `🚀 پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
+          `${PUMP_ICON} پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
           `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
@@ -265,10 +269,10 @@ async function evaluate(now) {
         notifiedDump.set(id, true);
         const trend = await trendConfirmation(id, "down");
         const conf = confidenceScore(m, Math.abs(minChange), trend);
-        const lines = dumpWindows.map((w) => `${w} دقیقه: ${changes[w].toFixed(1)}٪`).join("\n");
+        const lines = dumpWindows.map((w) => `${DUMP_ICON} ${w} دقیقه: ${changes[w].toFixed(1)}٪`).join("\n");
         const label = `${m.symbol.toUpperCase()} ${minChange.toFixed(1)}٪`;
         sendTelegram(
-          `🔻 افت شدید: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
+          `${DUMP_ICON} افت شدید: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
           `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
@@ -352,7 +356,7 @@ function checkPriceAlerts(now) {
   saveState();
   for (const { a, price } of triggered) {
     const left = remaining.filter((x) => x.coinId === a.coinId).length;
-    const arrow = a.dir === "above" ? "▲ بالاتر از" : "▼ پایین‌تر از";
+    const arrow = a.dir === "above" ? `${PUMP_ICON1} بالاتر از` : `${DUMP_ICON1} پایین‌تر از`;
     sendTelegram(
       `🔔 آلارم قیمت: ${a.symbol.toUpperCase()} (${a.name})\n` +
       `${arrow} $${fmtPrice(a.target)} رسید\n` +
@@ -360,7 +364,7 @@ function checkPriceAlerts(now) {
       `آلارم‌های باقی‌مانده‌ی ${a.symbol.toUpperCase()}: ${left}`,
       [[{ text: "📈 نمودار", url: chartLink(a.coinId) }]]
     );
-    pushHistoryLog("قیمت", a.symbol.toUpperCase(), a.name, `${a.symbol.toUpperCase()} ${a.dir === "above" ? "▲" : "▼"} ${fmtPrice(a.target)}`, a.coinId, price);
+    pushHistoryLog("قیمت", a.symbol.toUpperCase(), a.name, `${a.symbol.toUpperCase()} ${a.dir === "above" ? PUMP_ICON1 : DUMP_ICON1} ${fmtPrice(a.target)}`, a.coinId, price);
     console.log(`[PRICE ALERT] ${a.symbol.toUpperCase()} ${a.dir} ${a.target}`);
   }
 }
@@ -377,22 +381,29 @@ function normalizeInput(s) {
 }
 
 async function cmdAlert(parts) {
-  const usage = "مثال: /alert BTC 70000 75000 60000\n(بالاتر یا پایین‌تر بودن هر قیمت، خودکار نسبت به قیمت فعلی تشخیص داده می‌شه. قیمت‌ها رو با فاصله از هم جدا کن.)";
+  const usage = "مثال: /alert BTC 70000 75000 60000\n" +
+    "برای اجباری‌کردن جهت یه قیمت خاص: above یا below رو درست قبل همون قیمت بذار،\n" +
+    "مثلاً: /alert BTC above 70000 below 60000\n" +
+    "بدون این کلمه‌ها، جهت هر قیمت خودکار نسبت به قیمت فعلی تشخیص داده می‌شه.";
   if (parts.length < 3) { sendTelegram(usage); return; }
   const tokens = normalizeInput(parts.slice(2).join(" ")).split(/\s+/).filter(Boolean);
-  let forced = null;
-  const prices = [];
+  let pendingDir = null;
+  const entries = []; // {price, dirOverride}
   const invalid = [];
   for (const tok of tokens) {
     const low = tok.toLowerCase();
-    if (low === "above" || tok === "بالا") forced = "above";
-    else if (low === "below" || tok === "پایین") forced = "below";
-    else if (/^\d*\.?\d+$/.test(tok) && parseFloat(tok) > 0) prices.push(parseFloat(tok));
-    else invalid.push(tok);
+    if (low === "above" || tok === "بالا") { pendingDir = "above"; continue; }
+    if (low === "below" || tok === "پایین") { pendingDir = "below"; continue; }
+    if (/^\d*\.?\d+$/.test(tok) && parseFloat(tok) > 0) {
+      entries.push({ price: parseFloat(tok), dirOverride: pendingDir });
+      pendingDir = null;
+      continue;
+    }
+    invalid.push(tok);
   }
   if (invalid.length) { sendTelegram("قیمت نامعتبر: " + invalid.join("، ") + "\nاز نقطه برای اعشار استفاده کن و قیمت‌ها رو با فاصله جدا کن.\n" + usage); return; }
-  if (!prices.length) { sendTelegram(usage); return; }
-  if (prices.length > 10) { sendTelegram("حداکثر ۱۰ قیمت در هر دستور."); return; }
+  if (!entries.length) { sendTelegram(usage); return; }
+  if (entries.length > 10) { sendTelegram("حداکثر ۱۰ قیمت در هر دستور."); return; }
 
   const found = await resolveSymbolToId(parts[1]);
   if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
@@ -405,18 +416,20 @@ async function cmdAlert(parts) {
 
   const added = [];
   const skipped = [];
-  for (const price of prices) {
-    const dir = forced || (price > current ? "above" : "below");
+  for (const entry of entries) {
+    const price = entry.price;
+    const dir = entry.dirOverride || (price > current ? "above" : "below");
     if (dir === "above" && price <= current) { skipped.push(`${fmtPrice(price)} (قیمت فعلی از این بالاتره)`); continue; }
     if (dir === "below" && price >= current) { skipped.push(`${fmtPrice(price)} (قیمت فعلی از این پایین‌تره)`); continue; }
     const dup = state.priceAlerts.some((a) => a.coinId === found.id && a.dir === dir && Math.abs(a.target - price) / price < 1e-9);
     if (dup) { skipped.push(`${fmtPrice(price)} (از قبل ثبت شده)`); continue; }
     state.priceAlerts.push({ uid: state.nextAlertId++, coinId: found.id, symbol: found.symbol, name: found.name, target: price, dir, createdAt: Date.now() });
-    added.push(`${dir === "above" ? "▲" : "▼"} ${fmtPrice(price)}`);
+    added.push(`${dir === "above" ? PUMP_ICON1 : DUMP_ICON1} ${fmtPrice(price)}`);
   }
   saveState();
+  const existing = state.priceAlerts.filter((a) => a.coinId === found.id).length;
   let msg = "";
-  if (added.length) msg += `✅ آلارم قیمت ${found.symbol.toUpperCase()} ثبت شد:\n${added.join("\n")}\nقیمت فعلی: $${fmtPrice(current)}`;
+  if (added.length) msg += `✅ آلارم قیمت ${found.symbol.toUpperCase()} ثبت شد:\n${added.join("\n")}\nقیمت فعلی: $${fmtPrice(current)}\nمجموع آلارم‌های فعال ${found.symbol.toUpperCase()}: ${existing}`;
   if (skipped.length) msg += (msg ? "\n\n" : "") + "⚠️ ثبت نشد:\n" + skipped.join("\n");
   sendTelegram(msg);
 }
@@ -433,12 +446,12 @@ function cmdAlerts(parts) {
   const groups = {};
   list.forEach((a) => { const k = a.symbol.toUpperCase(); (groups[k] = groups[k] || []).push(a); });
   const lines = Object.keys(groups).map((k) =>
-    `${k}: ` + groups[k].slice().sort((x, y) => y.target - x.target).map((a) => `${a.dir === "above" ? "▲" : "▼"} ${fmtPrice(a.target)}`).join("  ")
+    `${k}: ` + groups[k].slice().sort((x, y) => y.target - x.target).map((a) => `${a.dir === "above" ? PUMP_ICON1 : DUMP_ICON1} ${fmtPrice(a.target)}`).join("  ")
   );
   const keyboard = [];
   let row = [];
   list.slice(0, 40).forEach((a) => {
-    row.push({ text: `❌ ${a.symbol.toUpperCase()} ${a.dir === "above" ? "▲" : "▼"}${fmtPrice(a.target)}`, callback_data: "delalert:" + a.uid });
+    row.push({ text: `❌ ${a.symbol.toUpperCase()} ${a.dir === "above" ? PUMP_ICON1 : DUMP_ICON1}${fmtPrice(a.target)}`, callback_data: "delalert:" + a.uid });
     if (row.length === 2) { keyboard.push(row); row = []; }
   });
   if (row.length) keyboard.push(row);
@@ -485,7 +498,7 @@ async function coinReport(symbolRaw, days) {
   text += "\n";
 
   const lines = items.slice(0, 15).map((h) => {
-    const icon = h.type === "پامپ" ? "🚀" : h.type === "دامپ" ? "🔻" : "🔔";
+    const icon = h.type === "پامپ" ? PUMP_ICON1 : h.type === "دامپ" ? DUMP_ICON1 : "🔔";
     let outcome = "";
     if (h.type !== "قیمت" && current != null && h.price) {
       const pct = ((current - h.price) / h.price) * 100;
@@ -503,7 +516,7 @@ async function coinReport(symbolRaw, days) {
     if (dumps.length) text += `\nاز ${dumps.length} دامپ، ${okDumps} مورد هنوز پایین‌تر از قیمت هشدار مونده.`;
   }
   if (active.length) {
-    text += `\n\n🔔 آلارم‌های قیمت فعال: ` + active.slice().sort((x, y) => y.target - x.target).map((a) => `${a.dir === "above" ? "▲" : "▼"} ${fmtPrice(a.target)}`).join("  ");
+    text += `\n\n🔔 آلارم‌های قیمت فعال: ` + active.slice().sort((x, y) => y.target - x.target).map((a) => `${a.dir === "above" ? PUMP_ICON1 : DUMP_ICON1} ${fmtPrice(a.target)}`).join("  ");
   }
   return text;
 }
@@ -577,7 +590,7 @@ function historyText() {
   if (!state.history.length) return "هنوز هشداری ثبت نشده.";
   return "🕘 آخرین هشدارها:\n" + state.history.slice(0, 10).map((h) => {
     const time = fmtDateTime(h.t);
-    const icon = h.type === "پامپ" ? "🚀" : h.type === "دامپ" ? "🔻" : "🔔";
+    const icon = h.type === "پامپ" ? PUMP_ICON1 : h.type === "دامپ" ? DUMP_ICON1 : "🔔";
     return `${icon} ${h.detail} — ${time}`;
   }).join("\n");
 }
