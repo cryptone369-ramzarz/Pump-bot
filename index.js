@@ -22,6 +22,7 @@ const WINDOWS_MINUTES = (process.env.WINDOWS_MINUTES || "1,5,15")
 const MAX_WINDOW_MINUTES = Math.max.apply(null, WINDOWS_MINUTES);
 const DEFAULT_BLACKLIST = ["tether","usd-coin","dai","binance-usd","first-digital-usd",
   "true-usd","frax","paypal-usd","usdd","gemini-dollar","usdt-erc20"];
+const TIMEZONE = process.env.TIMEZONE || "Asia/Tehran";
 const ENV_BLACKLIST = (process.env.BLACKLIST_IDS || "").split(",").map((s)=>s.trim()).filter(Boolean);
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -38,6 +39,8 @@ let state = {
   watchlist: [],
   blacklist: DEFAULT_BLACKLIST.concat(ENV_BLACKLIST),
   history: [], // [{t, type, symbol, name, detail, id, price}]
+  priceAlerts: [], // [{uid, coinId, symbol, name, target, dir, createdAt}]
+  nextAlertId: 1,
 };
 function loadState() {
   try {
@@ -69,7 +72,15 @@ function fmtNum(n) {
   if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return n.toString();
 }
+function fmtDateTime(ts) { return new Date(ts).toLocaleString("fa-IR", { timeZone: TIMEZONE }); }
+function fmtTimeOnly(ts) { return new Date(ts).toLocaleTimeString("fa-IR", { timeZone: TIMEZONE }); }
 function chartLink(id) { return `https://www.coingecko.com/en/coins/${id}`; }
+function fmtPrice(p) {
+  if (p == null || isNaN(p)) return "—";
+  if (p >= 1000) return p.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (p >= 1) return p.toLocaleString("en-US", { maximumFractionDigits: 4 });
+  return p.toLocaleString("en-US", { maximumSignificantDigits: 4, maximumFractionDigits: 10 });
+}
 
 function sendTelegram(text, keyboard) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -201,7 +212,7 @@ function computeChanges(arr, now) {
 }
 function pushHistoryLog(type, symbol, name, detail, id, price) {
   state.history.unshift({ t: Date.now(), type, symbol, name, detail, id, price });
-  if (state.history.length > 60) state.history.length = 60;
+  if (state.history.length > 500) state.history.length = 500;
   saveState();
 }
 
@@ -234,7 +245,7 @@ async function evaluate(now) {
         const label = `${m.symbol.toUpperCase()} +${maxChange.toFixed(1)}٪`;
         sendTelegram(
           `🚀 پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
-          `قیمت فعلی: $${latestPrice}\n` +
+          `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
           `اطمینان: ${conf.label} (${conf.score}/100)`,
@@ -258,7 +269,7 @@ async function evaluate(now) {
         const label = `${m.symbol.toUpperCase()} ${minChange.toFixed(1)}٪`;
         sendTelegram(
           `🔻 افت شدید: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
-          `قیمت فعلی: $${latestPrice}\n` +
+          `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
           `اطمینان: ${conf.label} (${conf.score}/100)`,
@@ -275,28 +286,39 @@ async function evaluate(now) {
 
 // ---------------- حلقه‌ی اصلی رصد بازار ----------------
 async function pollOnce() {
-  if (state.paused) return;
+  const hasPriceAlerts = state.priceAlerts.length > 0;
+  if (state.paused && !hasPriceAlerts) return;
   const now = Date.now();
+  const seen = new Set();
   try {
-    for (let p = 1; p <= PAGES; p++) {
-      const coins = await fetchMarketsPage(p);
-      for (const c of coins) {
+    if (!state.paused) {
+      for (let p = 1; p <= PAGES; p++) {
+        const coins = await fetchMarketsPage(p);
+        for (const c of coins) {
+          if (!c.current_price) continue;
+          meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
+          pushPrice(c.id, c.current_price, now);
+          seen.add(c.id);
+        }
+        if (p < PAGES) await sleep(2000);
+      }
+    }
+    // کوین‌هایی که آلارم قیمت یا واچ‌لیست دارن ولی توی صفحات بالا نبودن، هر بار جدا به‌روز می‌شن
+    const wanted = new Set(state.priceAlerts.map((a) => a.coinId));
+    if (!state.paused) state.watchlist.forEach((w) => wanted.add(w.id));
+    const missing = Array.from(wanted).filter((id) => !seen.has(id));
+    if (missing.length) {
+      if (seen.size) await sleep(1200);
+      const extra = await fetchMarketsByIds(missing);
+      for (const c of extra) {
         if (!c.current_price) continue;
         meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
         pushPrice(c.id, c.current_price, now);
-      }
-      if (p < PAGES) await sleep(2000);
-    }
-    const missing = state.watchlist.map((w) => w.id).filter((id) => !meta.has(id));
-    if (missing.length) {
-      await sleep(1200);
-      const extra = await fetchMarketsByIds(missing);
-      for (const c of extra) {
-        meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
-        pushPrice(c.id, c.current_price, now);
+        seen.add(c.id);
       }
     }
-    await evaluate(now);
+    if (!state.paused) await evaluate(now);
+    checkPriceAlerts(now);
     lastPollAt = now;
     if (downAlertSent) sendTelegram("✅ اتصال به بازار دوباره برقرار شد.");
     consecutiveErrors = 0;
@@ -310,6 +332,180 @@ async function pollOnce() {
       sendTelegram("⚠️ چند بار پیاپی نتونستم اطلاعات بازار رو بگیرم؛ احتمال مشکل در اتصال یا محدودیت API هست.");
     }
   }
+}
+
+// ---------------- آلارم‌های قیمت (چندتا برای هر کوین) ----------------
+function checkPriceAlerts(now) {
+  if (!state.priceAlerts.length) return;
+  const triggered = [];
+  const remaining = [];
+  for (const a of state.priceAlerts) {
+    const arr = history.get(a.coinId);
+    const last = arr && arr.length ? arr[arr.length - 1] : null;
+    if (!last || last.t !== now) { remaining.push(a); continue; } // داده‌ی تازه نداریم
+    const hit = a.dir === "above" ? last.p >= a.target : last.p <= a.target;
+    if (hit) triggered.push({ a, price: last.p });
+    else remaining.push(a);
+  }
+  if (!triggered.length) return;
+  state.priceAlerts = remaining;
+  saveState();
+  for (const { a, price } of triggered) {
+    const left = remaining.filter((x) => x.coinId === a.coinId).length;
+    const arrow = a.dir === "above" ? "▲ بالاتر از" : "▼ پایین‌تر از";
+    sendTelegram(
+      `🔔 آلارم قیمت: ${a.symbol.toUpperCase()} (${a.name})\n` +
+      `${arrow} $${fmtPrice(a.target)} رسید\n` +
+      `قیمت فعلی: $${fmtPrice(price)}\n` +
+      `آلارم‌های باقی‌مانده‌ی ${a.symbol.toUpperCase()}: ${left}`,
+      [[{ text: "📈 نمودار", url: chartLink(a.coinId) }]]
+    );
+    pushHistoryLog("قیمت", a.symbol.toUpperCase(), a.name, `${a.symbol.toUpperCase()} ${a.dir === "above" ? "▲" : "▼"} ${fmtPrice(a.target)}`, a.coinId, price);
+    console.log(`[PRICE ALERT] ${a.symbol.toUpperCase()} ${a.dir} ${a.target}`);
+  }
+}
+
+function normalizeInput(s) {
+  let out = String(s)
+    .replace(/[\u06F0-\u06F9]/g, (d) => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[\u0660-\u0669]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/\u066C/g, ",")
+    .replace(/\u066B/g, ".");
+  let prev;
+  do { prev = out; out = out.replace(/(\d),(\d{3})(?!\d)/g, "$1$2"); } while (out !== prev);
+  return out;
+}
+
+async function cmdAlert(parts) {
+  const usage = "مثال: /alert BTC 70000 75000 60000\n(بالاتر یا پایین‌تر بودن هر قیمت، خودکار نسبت به قیمت فعلی تشخیص داده می‌شه. قیمت‌ها رو با فاصله از هم جدا کن.)";
+  if (parts.length < 3) { sendTelegram(usage); return; }
+  const tokens = normalizeInput(parts.slice(2).join(" ")).split(/\s+/).filter(Boolean);
+  let forced = null;
+  const prices = [];
+  const invalid = [];
+  for (const tok of tokens) {
+    const low = tok.toLowerCase();
+    if (low === "above" || tok === "بالا") forced = "above";
+    else if (low === "below" || tok === "پایین") forced = "below";
+    else if (/^\d*\.?\d+$/.test(tok) && parseFloat(tok) > 0) prices.push(parseFloat(tok));
+    else invalid.push(tok);
+  }
+  if (invalid.length) { sendTelegram("قیمت نامعتبر: " + invalid.join("، ") + "\nاز نقطه برای اعشار استفاده کن و قیمت‌ها رو با فاصله جدا کن.\n" + usage); return; }
+  if (!prices.length) { sendTelegram(usage); return; }
+  if (prices.length > 10) { sendTelegram("حداکثر ۱۰ قیمت در هر دستور."); return; }
+
+  const found = await resolveSymbolToId(parts[1]);
+  if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
+  let current = null;
+  try {
+    const data = await fetchMarketsByIds([found.id]);
+    current = data[0] && data[0].current_price;
+  } catch (e) { /* ignore */ }
+  if (current == null) { sendTelegram("نتونستم قیمت فعلی رو بگیرم؛ چند لحظه‌ی دیگه دوباره امتحان کن."); return; }
+
+  const added = [];
+  const skipped = [];
+  for (const price of prices) {
+    const dir = forced || (price > current ? "above" : "below");
+    if (dir === "above" && price <= current) { skipped.push(`${fmtPrice(price)} (قیمت فعلی از این بالاتره)`); continue; }
+    if (dir === "below" && price >= current) { skipped.push(`${fmtPrice(price)} (قیمت فعلی از این پایین‌تره)`); continue; }
+    const dup = state.priceAlerts.some((a) => a.coinId === found.id && a.dir === dir && Math.abs(a.target - price) / price < 1e-9);
+    if (dup) { skipped.push(`${fmtPrice(price)} (از قبل ثبت شده)`); continue; }
+    state.priceAlerts.push({ uid: state.nextAlertId++, coinId: found.id, symbol: found.symbol, name: found.name, target: price, dir, createdAt: Date.now() });
+    added.push(`${dir === "above" ? "▲" : "▼"} ${fmtPrice(price)}`);
+  }
+  saveState();
+  let msg = "";
+  if (added.length) msg += `✅ آلارم قیمت ${found.symbol.toUpperCase()} ثبت شد:\n${added.join("\n")}\nقیمت فعلی: $${fmtPrice(current)}`;
+  if (skipped.length) msg += (msg ? "\n\n" : "") + "⚠️ ثبت نشد:\n" + skipped.join("\n");
+  sendTelegram(msg);
+}
+
+function cmdAlerts(parts) {
+  let list = state.priceAlerts;
+  let title = "🔔 آلارم‌های قیمت";
+  if (parts[1]) {
+    const sym = parts[1].toUpperCase();
+    list = list.filter((a) => a.symbol.toUpperCase() === sym);
+    title += " " + sym;
+  }
+  if (!list.length) { sendTelegram("آلارم قیمتی ثبت نشده. برای ثبت: /alert BTC 70000"); return; }
+  const groups = {};
+  list.forEach((a) => { const k = a.symbol.toUpperCase(); (groups[k] = groups[k] || []).push(a); });
+  const lines = Object.keys(groups).map((k) =>
+    `${k}: ` + groups[k].slice().sort((x, y) => y.target - x.target).map((a) => `${a.dir === "above" ? "▲" : "▼"} ${fmtPrice(a.target)}`).join("  ")
+  );
+  const keyboard = [];
+  let row = [];
+  list.slice(0, 40).forEach((a) => {
+    row.push({ text: `❌ ${a.symbol.toUpperCase()} ${a.dir === "above" ? "▲" : "▼"}${fmtPrice(a.target)}`, callback_data: "delalert:" + a.uid });
+    if (row.length === 2) { keyboard.push(row); row = []; }
+  });
+  if (row.length) keyboard.push(row);
+  sendTelegram(`${title}:\n${lines.join("\n")}\n\nبرای حذف، روی دکمه‌ی هر آلارم بزن.`, keyboard);
+}
+
+function cmdDelAlert(parts) {
+  if (!parts[1]) { sendTelegram("مثال: /delalert BTC 70000\nیا فقط /delalert BTC برای حذف همه‌ی آلارم‌های اون کوین"); return; }
+  const sym = parts[1].toUpperCase();
+  const nums = parts.length > 2
+    ? normalizeInput(parts.slice(2).join(" ")).split(/\s+/).map(parseFloat).filter((n) => !isNaN(n))
+    : [];
+  const before = state.priceAlerts.length;
+  state.priceAlerts = state.priceAlerts.filter((a) => {
+    if (a.symbol.toUpperCase() !== sym) return true;
+    if (!nums.length) return false;
+    return !nums.some((n) => Math.abs(n - a.target) / a.target < 1e-9);
+  });
+  const removed = before - state.priceAlerts.length;
+  saveState();
+  sendTelegram(removed ? `🗑 ${removed} آلارم ${sym} حذف شد.` : "آلارمی با این مشخصات پیدا نشد.");
+}
+
+// ---------------- گزارش هشدارهای یک کوین ----------------
+async function coinReport(symbolRaw, days) {
+  const symbol = symbolRaw.toUpperCase();
+  const cutoff = Date.now() - days * 86400000;
+  const items = state.history.filter((h) => h.symbol && h.symbol.toUpperCase() === symbol && h.t >= cutoff);
+  const active = state.priceAlerts.filter((a) => a.symbol.toUpperCase() === symbol);
+  if (!items.length && !active.length) return `برای ${symbol} توی ${days} روز اخیر هشداری ثبت نشده.`;
+
+  const coinId = (items[0] && items[0].id) || (active[0] && active[0].coinId);
+  let current = null;
+  if (coinId) {
+    try { const d = await fetchMarketsByIds([coinId]); current = d[0] && d[0].current_price; } catch (e) { /* ignore */ }
+  }
+  const pumps = items.filter((h) => h.type === "پامپ");
+  const dumps = items.filter((h) => h.type === "دامپ");
+  const priceHits = items.filter((h) => h.type === "قیمت");
+
+  let text = `📋 گزارش ${symbol} — ${days} روز اخیر\n`;
+  text += `🚀 پامپ: ${pumps.length} | 🔻 دامپ: ${dumps.length} | 🔔 آلارم قیمت فعال‌شده: ${priceHits.length}\n`;
+  if (current != null) text += `قیمت فعلی: $${fmtPrice(current)}\n`;
+  text += "\n";
+
+  const lines = items.slice(0, 15).map((h) => {
+    const icon = h.type === "پامپ" ? "🚀" : h.type === "دامپ" ? "🔻" : "🔔";
+    let outcome = "";
+    if (h.type !== "قیمت" && current != null && h.price) {
+      const pct = ((current - h.price) / h.price) * 100;
+      outcome = ` → الان ${pct >= 0 ? "+" : ""}${pct.toFixed(1)}٪`;
+    }
+    return `${icon} ${h.detail} | $${fmtPrice(h.price)}${outcome}\n    ${fmtDateTime(h.t)}`;
+  });
+  if (lines.length) text += lines.join("\n") + "\n";
+  if (items.length > 15) text += `... و ${items.length - 15} مورد قدیمی‌تر\n`;
+
+  if (current != null) {
+    const okPumps = pumps.filter((h) => h.price && current > h.price).length;
+    const okDumps = dumps.filter((h) => h.price && current < h.price).length;
+    if (pumps.length) text += `\nاز ${pumps.length} پامپ، ${okPumps} مورد هنوز بالاتر از قیمت هشدار مونده.`;
+    if (dumps.length) text += `\nاز ${dumps.length} دامپ، ${okDumps} مورد هنوز پایین‌تر از قیمت هشدار مونده.`;
+  }
+  if (active.length) {
+    text += `\n\n🔔 آلارم‌های قیمت فعال: ` + active.slice().sort((x, y) => y.target - x.target).map((a) => `${a.dir === "above" ? "▲" : "▼"} ${fmtPrice(a.target)}`).join("  ");
+  }
+  return text;
 }
 
 // ---------------- بک‌تست ساده (بر اساس هشدارهای واقعی گذشته) ----------------
@@ -353,7 +549,7 @@ function helpText() {
     "/status — وضعیت فعلی\n" +
     "/threshold <عدد> — تغییر آستانه‌ی پامپ (٪)\n" +
     "/dumpthreshold <عدد> — تغییر آستانه‌ی افت (٪)\n" +
-    "/pause — توقف موقت رصد\n" +
+    "/pause — توقف موقت رصد پامپ/دامپ (آلارم‌های قیمت فعال می‌مونن)\n" +
     "/resume — از سرگیری رصد\n" +
     "/watch <SYMBOL> — اضافه‌کردن به واچ‌لیست\n" +
     "/unwatch <SYMBOL> — حذف از واچ‌لیست\n" +
@@ -363,6 +559,10 @@ function helpText() {
     "/blacklistshow — نمایش لیست سیاه\n" +
     "/history — آخرین هشدارها\n" +
     "/backtest <روز> — عملکرد واقعی هشدارهای گذشته (پیش‌فرض ۷ روز)\n" +
+    "/alert <SYMBOL> <قیمت> [قیمت دوم ...] — ثبت آلارم قیمت (چندتا هم‌زمان)\n" +
+    "/alerts [SYMBOL] — لیست آلارم‌های قیمت (با دکمه‌ی حذف)\n" +
+    "/delalert <SYMBOL> [قیمت] — حذف آلارم (بدون قیمت = همه‌ی آلارم‌های اون کوین)\n" +
+    "/report <SYMBOL> [روز] — گزارش هشدارهای یک کوین (پیش‌فرض ۳۰ روز)\n" +
     "/help — همین راهنما";
 }
 function statusText() {
@@ -370,14 +570,14 @@ function statusText() {
     `حالت: ${state.paused ? "متوقف ⏸" : "فعال ▶️"}\n` +
     `آستانه‌ی پامپ: ${state.threshold}٪ | آستانه‌ی افت: ${state.dumpThreshold}٪\n` +
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
-    `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length}\n` +
-    `آخرین بروزرسانی: ${lastPollAt ? new Date(lastPollAt).toLocaleTimeString("fa-IR") : "—"}`;
+    `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length} | آلارم قیمت: ${state.priceAlerts.length}\n` +
+    `آخرین بروزرسانی: ${lastPollAt ? fmtTimeOnly(lastPollAt) : "—"}`;
 }
 function historyText() {
   if (!state.history.length) return "هنوز هشداری ثبت نشده.";
   return "🕘 آخرین هشدارها:\n" + state.history.slice(0, 10).map((h) => {
-    const time = new Date(h.t).toLocaleString("fa-IR");
-    const icon = h.type === "پامپ" ? "🚀" : "🔻";
+    const time = fmtDateTime(h.t);
+    const icon = h.type === "پامپ" ? "🚀" : h.type === "دامپ" ? "🔻" : "🔔";
     return `${icon} ${h.detail} — ${time}`;
   }).join("\n");
 }
@@ -395,6 +595,15 @@ async function handleCommand(text) {
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
+  if (cmd === "/alert") { await cmdAlert(parts); return; }
+  if (cmd === "/alerts") { cmdAlerts(parts); return; }
+  if (cmd === "/delalert") { cmdDelAlert(parts); return; }
+  if (cmd === "/report") {
+    if (!parts[1]) { sendTelegram("مثال: /report BTC   یا   /report BTC 7"); return; }
+    const days = parseFloat(parts[2]) || 30;
+    sendTelegram(await coinReport(parts[1], days));
+    return;
+  }
   if (cmd === "/status") { sendTelegram(statusText()); return; }
   if (cmd === "/help" || cmd === "/start") { sendTelegram(helpText()); return; }
   if (cmd === "/history") { sendTelegram(historyText()); return; }
@@ -417,7 +626,7 @@ async function handleCommand(text) {
     else sendTelegram("عدد نامعتبر. مثال: /dumpthreshold 6");
     return;
   }
-  if (cmd === "/pause") { state.paused = true; saveState(); sendTelegram("⏸ رصد بازار متوقف شد."); return; }
+  if (cmd === "/pause") { state.paused = true; saveState(); sendTelegram("⏸ رصد پامپ/دامپ متوقف شد. آلارم‌های قیمت همچنان فعالن."); return; }
   if (cmd === "/resume") { state.paused = false; saveState(); sendTelegram("▶️ رصد بازار از سر گرفته شد."); return; }
 
   if (cmd === "/watch") {
@@ -466,7 +675,13 @@ async function handleCommand(text) {
 
 async function handleCallback(cq) {
   const data = cq.data || "";
-  if (data.startsWith("blacklist:")) {
+  if (data.startsWith("delalert:")) {
+    const uid = parseInt(data.slice("delalert:".length), 10);
+    const before = state.priceAlerts.length;
+    state.priceAlerts = state.priceAlerts.filter((a) => a.uid !== uid);
+    saveState();
+    answerCallback(cq.id, state.priceAlerts.length < before ? "آلارم حذف شد ✅" : "این آلارم قبلاً حذف شده");
+  } else if (data.startsWith("blacklist:")) {
     const id = data.slice("blacklist:".length);
     if (!state.blacklist.includes(id)) { state.blacklist.push(id); saveState(); }
     const m = meta.get(id);
