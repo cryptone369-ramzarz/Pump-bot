@@ -119,6 +119,16 @@ function answerCallback(id, text) {
     body: JSON.stringify({ callback_query_id: id, text: text, show_alert: false }),
   }).catch(() => {});
 }
+function editMessage(chatId, messageId, text, keyboard) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+  const body = { chat_id: chatId, message_id: messageId, text: text };
+  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => console.error("خطا در ویرایش پیام تلگرام:", err.message));
+}
 
 // ---------------- تأیید روند ۴ ساعته ----------------
 async function fetchOHLC4h(id) {
@@ -524,15 +534,15 @@ async function cmdAlert(parts) {
   sendTelegram(msg);
 }
 
-function cmdAlerts(parts) {
+function buildAlertsView(parts) {
   let list = state.priceAlerts;
   let title = "🔔 آلارم‌های قیمت";
-  if (parts[1]) {
+  if (parts && parts[1]) {
     const sym = parts[1].toUpperCase();
     list = list.filter((a) => a.symbol.toUpperCase() === sym);
     title += " " + sym;
   }
-  if (!list.length) { sendTelegram("آلارم قیمتی ثبت نشده. برای ثبت: /alert BTC 70000"); return; }
+  if (!list.length) return { text: "آلارم قیمتی ثبت نشده. برای ثبت: /alert BTC 70000", keyboard: null };
   const groups = {};
   list.forEach((a) => { const k = a.symbol.toUpperCase(); (groups[k] = groups[k] || []).push(a); });
   const lines = Object.keys(groups).map((k) =>
@@ -545,7 +555,11 @@ function cmdAlerts(parts) {
     if (row.length === 2) { keyboard.push(row); row = []; }
   });
   if (row.length) keyboard.push(row);
-  sendTelegram(`${title}:\n${lines.join("\n")}\n\nبرای حذف، روی دکمه‌ی هر آلارم بزن.`, keyboard);
+  return { text: `${title}:\n${lines.join("\n")}\n\nبرای حذف، روی دکمه‌ی هر آلارم بزن.`, keyboard };
+}
+function cmdAlerts(parts) {
+  const v = buildAlertsView(parts);
+  sendTelegram(v.text, v.keyboard);
 }
 
 function cmdDelAlert(parts) {
@@ -702,11 +716,105 @@ function checkDailySummary() {
   }
 }
 
+// ---------------- منوی دکمه‌ای ----------------
+function menuMain() {
+  return {
+    text: "📋 منوی پامپ‌یاب\nیه بخش رو انتخاب کن:",
+    keyboard: [
+      [{ text: (state.paused ? "▶️ ادامه‌ی رصد" : "⏸ توقف رصد"), callback_data: "toggle:paused:main" }, { text: "📊 وضعیت کامل", callback_data: "show:status" }],
+      [{ text: "🎯 آستانه‌ها", callback_data: "menu:thresholds" }, { text: "⭐ واچ‌لیست / لیست سیاه", callback_data: "menu:lists" }],
+      [{ text: "🔔 آلارم قیمت", callback_data: "menu:pricealerts" }, { text: "🔇 سکوت موقت", callback_data: "menu:mute" }],
+      [{ text: "📋 گزارش و تاریخچه", callback_data: "menu:reports" }, { text: "⚙️ تنظیمات پیشرفته", callback_data: "menu:advanced" }],
+    ],
+  };
+}
+function menuThresholds() {
+  return {
+    text: "🎯 آستانه‌ها\n\n" +
+      `پامپ فعلی: ${state.threshold}٪\nافت فعلی: ${state.dumpThreshold}٪\n\n` +
+      "برای تغییر، یکی از این‌ها رو تایپ و بفرست:\n/threshold 7\n/dumpthreshold 6",
+    keyboard: [[{ text: "🔙 منو", callback_data: "menu:main" }]],
+  };
+}
+function menuLists() {
+  return {
+    text: "⭐ واچ‌لیست / لیست سیاه\n\n" +
+      "برای افزودن، تایپ کن:\n/watch BTC — همیشه رصد بشه\n/blacklist DOGE — کامل نادیده گرفته بشه",
+    keyboard: [
+      [{ text: "⭐ نمایش واچ‌لیست", callback_data: "show:watchlist" }, { text: "🚫 نمایش لیست سیاه", callback_data: "show:blacklistshow" }],
+      [{ text: "🔙 منو", callback_data: "menu:main" }],
+    ],
+  };
+}
+function menuPriceAlerts() {
+  return {
+    text: "🔔 آلارم قیمت\n\n" +
+      "برای ثبت، تایپ کن:\n/alert BTC 70000 75000\n(چندتا قیمت با فاصله؛ above/below هم قابل استفاده‌ست)",
+    keyboard: [
+      [{ text: "🔔 نمایش آلارم‌های فعال", callback_data: "show:alerts" }],
+      [{ text: "🔙 منو", callback_data: "menu:main" }],
+    ],
+  };
+}
+function menuMute() {
+  return {
+    text: "🔇 سکوت موقت\n\n" +
+      "برای سکوت یه کوین، تایپ کن:\n/mute DOGE 6h  (یا 30m، 1d)\nبرای لغو: /unmute DOGE",
+    keyboard: [
+      [{ text: "🔇 نمایش کوین‌های ساکت‌شده", callback_data: "show:mutes" }],
+      [{ text: "🔙 منو", callback_data: "menu:main" }],
+    ],
+  };
+}
+function menuReports() {
+  return {
+    text: "📋 گزارش و تاریخچه\n\nبرای گزارش یه کوین خاص تایپ کن:\n/report BTC 7",
+    keyboard: [
+      [{ text: "🕘 آخرین هشدارها", callback_data: "show:history" }, { text: "🗓 خلاصه‌ی امروز", callback_data: "run:summarynow" }],
+      [{ text: "📈 بک‌تست ۷ روز", callback_data: "run:backtest7" }, { text: "📄 خروجی CSV ۳۰ روز", callback_data: "run:export30" }],
+      [{ text: "🔙 منو", callback_data: "menu:main" }],
+    ],
+  };
+}
+function menuAdvanced() {
+  return {
+    text: "⚙️ تنظیمات پیشرفته\n\n" +
+      `آستانه‌ی پویا: ${state.dynamicEnabled ? "فعال ✅" : "غیرفعال ⏹"} (ضریب ${state.dynamicFactor})\n` +
+      `هشدار جهش حجم: ${state.volumeAlertEnabled ? "فعال ✅" : "غیرفعال ⏹"} (×${state.volumeSpikeMultiplier})\n` +
+      `خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "فعال ✅ (ساعت " + state.dailySummaryHour + ")" : "غیرفعال ⏹"}`,
+    keyboard: [
+      [{ text: state.dynamicEnabled ? "⏹ خاموش‌کردن آستانه‌ی پویا" : "✅ روشن‌کردن آستانه‌ی پویا", callback_data: "toggle:dynamicEnabled:advanced" }],
+      [{ text: state.volumeAlertEnabled ? "⏹ خاموش‌کردن هشدار حجم" : "✅ روشن‌کردن هشدار حجم", callback_data: "toggle:volumeAlertEnabled:advanced" }],
+      [{ text: state.dailySummaryEnabled ? "⏹ خاموش‌کردن خلاصه‌ی روزانه" : "✅ روشن‌کردن خلاصه‌ی روزانه", callback_data: "toggle:dailySummaryEnabled:advanced" }],
+      [{ text: "🔙 منو", callback_data: "menu:main" }],
+    ],
+  };
+}
+function getMenuSection(section) {
+  if (section === "thresholds") return menuThresholds();
+  if (section === "lists") return menuLists();
+  if (section === "pricealerts") return menuPriceAlerts();
+  if (section === "mute") return menuMute();
+  if (section === "reports") return menuReports();
+  if (section === "advanced") return menuAdvanced();
+  return menuMain();
+}
+function getShowContent(key) {
+  if (key === "status") return { text: statusText(), keyboard: null };
+  if (key === "watchlist") return { text: state.watchlist.length ? "⭐ واچ‌لیست:\n" + state.watchlist.map((w) => w.symbol.toUpperCase()).join("، ") : "واچ‌لیست خالیه.", keyboard: null };
+  if (key === "blacklistshow") return { text: "🚫 لیست سیاه:\n" + state.blacklist.join("، "), keyboard: null };
+  if (key === "alerts") return buildAlertsView(null);
+  if (key === "mutes") { cleanupMutes(Date.now()); return { text: state.mutes.length ? "🔇 کوین‌های ساکت‌شده:\n" + state.mutes.map((mm) => `${mm.symbol.toUpperCase()} تا ${fmtDateTime(mm.until)}`).join("\n") : "هیچ کوینی ساکت نیست.", keyboard: null }; }
+  if (key === "history") return { text: historyText(), keyboard: null };
+  return { text: "—", keyboard: null };
+}
+
 // ---------------- دستورات و دکمه‌های تلگرام ----------------
 let telegramOffset = 0;
 
 function helpText() {
   return "دستورات قابل استفاده:\n" +
+    "/menu — منوی دکمه‌ای همه‌ی بخش‌ها (پیشنهاد می‌شه از همین شروع کنی)\n" +
     "/status — وضعیت فعلی\n" +
     "/threshold <عدد> — تغییر آستانه‌ی پامپ (٪)\n" +
     "/dumpthreshold <عدد> — تغییر آستانه‌ی افت (٪)\n" +
@@ -778,6 +886,7 @@ async function handleCommand(text) {
     sendTelegram(await coinReport(parts[1], days));
     return;
   }
+  if (cmd === "/menu") { const v = menuMain(); sendTelegram(v.text, v.keyboard); return; }
   if (cmd === "/status") { sendTelegram(statusText()); return; }
   if (cmd === "/help" || cmd === "/start") { sendTelegram(helpText()); return; }
   if (cmd === "/history") { sendTelegram(historyText()); return; }
@@ -925,20 +1034,58 @@ async function handleCommand(text) {
 
 async function handleCallback(cq) {
   const data = cq.data || "";
+  const chatId = cq.message.chat.id;
+  const msgId = cq.message.message_id;
+
   if (data.startsWith("delalert:")) {
     const uid = parseInt(data.slice("delalert:".length), 10);
     const before = state.priceAlerts.length;
     state.priceAlerts = state.priceAlerts.filter((a) => a.uid !== uid);
     saveState();
     answerCallback(cq.id, state.priceAlerts.length < before ? "آلارم حذف شد ✅" : "این آلارم قبلاً حذف شده");
-  } else if (data.startsWith("blacklist:")) {
+    return;
+  }
+  if (data.startsWith("blacklist:")) {
     const id = data.slice("blacklist:".length);
     if (!state.blacklist.includes(id)) { state.blacklist.push(id); saveState(); }
     const m = meta.get(id);
     answerCallback(cq.id, (m ? m.symbol.toUpperCase() : id) + " مسدود شد ✅");
-  } else {
-    answerCallback(cq.id, "دستور ناشناخته");
+    return;
   }
+  if (data.startsWith("menu:")) {
+    const section = data.slice("menu:".length);
+    const v = getMenuSection(section);
+    answerCallback(cq.id, "");
+    editMessage(chatId, msgId, v.text, v.keyboard);
+    return;
+  }
+  if (data.startsWith("show:")) {
+    const key = data.slice("show:".length);
+    const v = getShowContent(key);
+    answerCallback(cq.id, "");
+    editMessage(chatId, msgId, v.text, (v.keyboard || []).concat([[{ text: "🔙 منو", callback_data: "menu:main" }]]));
+    return;
+  }
+  if (data.startsWith("toggle:")) {
+    const [, field, backTo] = data.split(":");
+    if (Object.prototype.hasOwnProperty.call(state, field) && typeof state[field] === "boolean") {
+      state[field] = !state[field];
+      saveState();
+    }
+    answerCallback(cq.id, "به‌روز شد ✅");
+    const v = getMenuSection(backTo === "main" ? "main" : backTo);
+    editMessage(chatId, msgId, v.text, v.keyboard);
+    return;
+  }
+  if (data.startsWith("run:")) {
+    const action = data.slice("run:".length);
+    answerCallback(cq.id, "در حال اجرا...");
+    if (action === "backtest7") { sendTelegram(await backtestReport(7)); return; }
+    if (action === "export30") { await sendCsvExport(30); return; }
+    if (action === "summarynow") { sendTelegram(buildDailySummaryText()); return; }
+    return;
+  }
+  answerCallback(cq.id, "دستور ناشناخته");
 }
 
 async function pollTelegramCommands() {
