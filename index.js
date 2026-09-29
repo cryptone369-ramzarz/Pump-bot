@@ -23,6 +23,9 @@ const MAX_WINDOW_MINUTES = Math.max.apply(null, WINDOWS_MINUTES);
 const DEFAULT_BLACKLIST = ["tether","usd-coin","dai","binance-usd","first-digital-usd",
   "true-usd","frax","paypal-usd","usdd","gemini-dollar","usdt-erc20"];
 const TIMEZONE = process.env.TIMEZONE || "Asia/Tehran";
+const DYNAMIC_THRESHOLD_FACTOR_DEFAULT = parseFloat(process.env.DYNAMIC_THRESHOLD_FACTOR || "0.4");
+const VOLUME_SPIKE_MULTIPLIER_DEFAULT = parseFloat(process.env.VOLUME_SPIKE_MULTIPLIER || "2.5");
+const DAILY_SUMMARY_HOUR_DEFAULT = parseInt(process.env.DAILY_SUMMARY_HOUR || "9", 10);
 const ENV_BLACKLIST = (process.env.BLACKLIST_IDS || "").split(",").map((s)=>s.trim()).filter(Boolean);
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -41,6 +44,14 @@ let state = {
   history: [], // [{t, type, symbol, name, detail, id, price}]
   priceAlerts: [], // [{uid, coinId, symbol, name, target, dir, createdAt}]
   nextAlertId: 1,
+  dynamicEnabled: true,
+  dynamicFactor: DYNAMIC_THRESHOLD_FACTOR_DEFAULT,
+  volumeAlertEnabled: true,
+  volumeSpikeMultiplier: VOLUME_SPIKE_MULTIPLIER_DEFAULT,
+  mutes: [], // [{id, symbol, until}]
+  dailySummaryEnabled: true,
+  dailySummaryHour: DAILY_SUMMARY_HOUR_DEFAULT,
+  lastSummaryDate: null,
 };
 function loadState() {
   try {
@@ -58,6 +69,10 @@ const history = new Map();
 const meta = new Map();
 const notifiedPump = new Map();
 const notifiedDump = new Map();
+const notifiedVolume = new Map();
+const volatilityEma = new Map();  // id -> EMA میانگین قدرمطلق تغییر ۲۴ ساعته (شاخص نوسان معمول کوین)
+const volumeEma = new Map();      // id -> EMA حجم ۲۴ ساعته (پایه برای تشخیص جهش حجم)
+const sampleCount = new Map();    // id -> تعداد نمونه‌ی دیده‌شده (برای اطمینان از پایدار بودن EMA)
 
 let lastPollAt = null;
 let consecutiveErrors = 0;
@@ -214,10 +229,54 @@ function computeChanges(arr, now) {
   }
   return changes;
 }
-function pushHistoryLog(type, symbol, name, detail, id, price) {
-  state.history.unshift({ t: Date.now(), type, symbol, name, detail, id, price });
+function pushHistoryLog(type, symbol, name, detail, id, price, changePct) {
+  state.history.unshift({ t: Date.now(), type, symbol, name, detail, id, price, changePct });
   if (state.history.length > 500) state.history.length = 500;
   saveState();
+}
+
+// ---------------- آستانه‌ی پویا، سکوت موقت، و جهش حجم ----------------
+function updateBaselines(c, now) {
+  const id = c.id;
+  const chg24h = typeof c.price_change_percentage_24h === "number" ? Math.abs(c.price_change_percentage_24h) : null;
+  const vol = c.total_volume || 0;
+  const n = (sampleCount.get(id) || 0) + 1;
+  sampleCount.set(id, n);
+  const alpha = n < 10 ? 1 / n : 0.1; // شروع سریع، بعد پایدار
+  if (chg24h != null) {
+    const prevV = volatilityEma.get(id);
+    volatilityEma.set(id, prevV == null ? chg24h : prevV + alpha * (chg24h - prevV));
+  }
+  const prevVol = volumeEma.get(id);
+  volumeEma.set(id, prevVol == null ? vol : prevVol + alpha * (vol - prevVol));
+}
+function effectiveThresholds(id) {
+  let pump = state.threshold, dump = state.dumpThreshold;
+  if (state.dynamicEnabled) {
+    const baseline = volatilityEma.get(id);
+    const n = sampleCount.get(id) || 0;
+    if (baseline != null && n >= 5) {
+      const scaled = baseline * state.dynamicFactor;
+      pump = Math.max(state.threshold, scaled);
+      dump = -Math.max(Math.abs(state.dumpThreshold), scaled);
+    }
+  }
+  return { pump, dump };
+}
+function cleanupMutes(now) {
+  const before = state.mutes.length;
+  state.mutes = state.mutes.filter((m) => m.until > now);
+  if (state.mutes.length !== before) saveState();
+}
+function isMuted(id, now) { return state.mutes.some((m) => m.id === id && m.until > now); }
+function parseDuration(text) {
+  const m = String(text).trim().match(/^(\d+(?:\.\d+)?)\s*(m|min|h|d)?$/i);
+  if (!m) return null;
+  const val = parseFloat(m[1]);
+  const unit = (m[2] || "h").toLowerCase();
+  const mult = unit === "d" ? 24 * 3600000 : unit === "m" || unit === "min" ? 60000 : 3600000;
+  const ms = val * mult;
+  return ms > 0 ? ms : null;
 }
 
 // ---------------- ارزیابی و اطلاع‌رسانی ----------------
@@ -230,7 +289,9 @@ async function evaluate(now) {
     if (state.blacklist.includes(id)) continue;
     const isWatched = watchIds.has(id);
     if (!isWatched && m.volume < MIN_VOLUME_USD) continue;
+    if (isMuted(id, now)) continue; // این کوین موقتاً ساکت شده
 
+    const eff = effectiveThresholds(id);
     const changes = computeChanges(arr, now);
     const vals = Object.values(changes).filter((v) => v != null);
     if (!vals.length) continue;
@@ -238,7 +299,7 @@ async function evaluate(now) {
     const minChange = Math.min.apply(null, vals);
     const latestPrice = arr[arr.length - 1].p;
 
-    const pumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] >= state.threshold);
+    const pumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] >= eff.pump);
     const wasPump = notifiedPump.get(id) || false;
     if (pumpWindows.length) {
       if (!wasPump) {
@@ -255,14 +316,14 @@ async function evaluate(now) {
           `اطمینان: ${conf.label} (${conf.score}/100)`,
           [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
         );
-        pushHistoryLog("پامپ", m.symbol.toUpperCase(), m.name, label, id, latestPrice);
+        pushHistoryLog("پامپ", m.symbol.toUpperCase(), m.name, label, id, latestPrice, maxChange);
         console.log(`[PUMP] ${label}`);
       }
-    } else if (maxChange < state.threshold - HYSTERESIS_PERCENT) {
+    } else if (maxChange < eff.pump - HYSTERESIS_PERCENT) {
       notifiedPump.set(id, false);
     }
 
-    const dumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] <= state.dumpThreshold);
+    const dumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] <= eff.dump);
     const wasDump = notifiedDump.get(id) || false;
     if (dumpWindows.length) {
       if (!wasDump) {
@@ -279,11 +340,37 @@ async function evaluate(now) {
           `اطمینان: ${conf.label} (${conf.score}/100)`,
           [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
         );
-        pushHistoryLog("دامپ", m.symbol.toUpperCase(), m.name, label, id, latestPrice);
+        pushHistoryLog("دامپ", m.symbol.toUpperCase(), m.name, label, id, latestPrice, minChange);
         console.log(`[DUMP] ${label}`);
       }
-    } else if (minChange > state.dumpThreshold + HYSTERESIS_PERCENT) {
+    } else if (minChange > eff.dump + HYSTERESIS_PERCENT) {
       notifiedDump.set(id, false);
+    }
+
+    // --- جهش حجم معاملات (مستقل از حرکت قیمت) ---
+    if (state.volumeAlertEnabled) {
+      const baseline = volumeEma.get(id);
+      const n = sampleCount.get(id) || 0;
+      const ratio = baseline ? m.volume / baseline : null;
+      const wasVol = notifiedVolume.get(id) || false;
+      if (baseline && n >= 5 && ratio >= state.volumeSpikeMultiplier) {
+        if (!wasVol) {
+          notifiedVolume.set(id, true);
+          const pct = (ratio - 1) * 100;
+          const label = `${m.symbol.toUpperCase()} حجم ${ratio.toFixed(1)}× معمول`;
+          sendTelegram(
+            `📢 جهش حجم معاملات: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n` +
+            `حجم فعلی ${ratio.toFixed(1)} برابر میانگین معمول این کوینه (بدون نیاز به حرکت قیمت)\n` +
+            `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
+            `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}`,
+            [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
+          );
+          pushHistoryLog("حجم", m.symbol.toUpperCase(), m.name, label, id, latestPrice, pct);
+          console.log(`[VOLUME] ${label}`);
+        }
+      } else if (ratio != null && ratio < state.volumeSpikeMultiplier * 0.7) {
+        notifiedVolume.set(id, false);
+      }
     }
   }
 }
@@ -302,6 +389,7 @@ async function pollOnce() {
           if (!c.current_price) continue;
           meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
           pushPrice(c.id, c.current_price, now);
+          updateBaselines(c, now);
           seen.add(c.id);
         }
         if (p < PAGES) await sleep(2000);
@@ -318,9 +406,11 @@ async function pollOnce() {
         if (!c.current_price) continue;
         meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
         pushPrice(c.id, c.current_price, now);
+        updateBaselines(c, now);
         seen.add(c.id);
       }
     }
+    cleanupMutes(now);
     if (!state.paused) await evaluate(now);
     checkPriceAlerts(now);
     lastPollAt = now;
@@ -554,6 +644,64 @@ async function backtestReport(days) {
   );
 }
 
+// ---------------- خروجی CSV ----------------
+async function sendCsvExport(days) {
+  const cutoff = Date.now() - days * 86400000;
+  const rows = state.history.filter((h) => h.t >= cutoff);
+  if (!rows.length) { sendTelegram("داده‌ای برای خروجی گرفتن توی این بازه پیدا نشد."); return; }
+  let csv = "time_utc,type,symbol,name,detail,price,change_percent\n";
+  const esc = (s) => String(s == null ? "" : s).replace(/"/g, '""').replace(/\n/g, " ");
+  for (const h of rows) {
+    csv += [new Date(h.t).toISOString(), h.type, h.symbol, `"${esc(h.name)}"`, `"${esc(h.detail)}"`, h.price ?? "", h.changePct != null ? h.changePct.toFixed(2) : ""].join(",") + "\n";
+  }
+  try {
+    const blob = new Blob([csv], { type: "text/csv" });
+    const form = new FormData();
+    form.append("chat_id", TELEGRAM_CHAT_ID);
+    form.append("document", blob, `pumpyab-history-${days}d.csv`);
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
+    const res = await fetch(url, { method: "POST", body: form });
+    if (!res.ok) sendTelegram("خطا در ارسال فایل CSV.");
+  } catch (e) {
+    sendTelegram("خطا در ارسال فایل CSV: " + e.message);
+  }
+}
+
+// ---------------- خلاصه‌ی روزانه ----------------
+function tehranDateKey(now) {
+  return new Date(now).toLocaleDateString("en-CA", { timeZone: TIMEZONE }); // YYYY-MM-DD
+}
+function buildDailySummaryText() {
+  const cutoff = Date.now() - 24 * 3600000;
+  const items = state.history.filter((h) => h.t >= cutoff);
+  const pumps = items.filter((h) => h.type === "پامپ");
+  const dumps = items.filter((h) => h.type === "دامپ");
+  const vols = items.filter((h) => h.type === "حجم");
+  const priceHits = items.filter((h) => h.type === "قیمت");
+  let text = "🗓 خلاصه‌ی ۲۴ ساعت اخیر\n\n";
+  text += `${PUMP_ICON1} پامپ: ${pumps.length} | ${DUMP_ICON1} دامپ: ${dumps.length} | 📢 جهش حجم: ${vols.length} | 🔔 آلارم قیمت: ${priceHits.length}\n`;
+  const topPump = pumps.slice().sort((a, b) => (b.changePct || 0) - (a.changePct || 0))[0];
+  const topDump = dumps.slice().sort((a, b) => (a.changePct || 0) - (b.changePct || 0))[0];
+  const topVol = vols.slice().sort((a, b) => (b.changePct || 0) - (a.changePct || 0))[0];
+  if (topPump) text += `\nبیشترین رشد: ${topPump.symbol} (+${(topPump.changePct || 0).toFixed(1)}٪)`;
+  if (topDump) text += `\nبیشترین افت: ${topDump.symbol} (${(topDump.changePct || 0).toFixed(1)}٪)`;
+  if (topVol) text += `\nبزرگ‌ترین جهش حجم: ${topVol.symbol} (${(topVol.changePct || 0).toFixed(0)}٪ بالاتر از معمول)`;
+  if (!items.length) text += "\nدیشب و امروز هیچ هشداری ثبت نشد.";
+  return text;
+}
+function checkDailySummary() {
+  if (!state.dailySummaryEnabled) return;
+  const now = Date.now();
+  const hourStr = new Intl.DateTimeFormat("en-GB", { timeZone: TIMEZONE, hour: "2-digit", minute: "2-digit", hour12: false }).format(now);
+  const [hh, mm] = hourStr.split(":").map(Number);
+  const todayKey = tehranDateKey(now);
+  if (hh === state.dailySummaryHour && mm === 0 && state.lastSummaryDate !== todayKey) {
+    state.lastSummaryDate = todayKey;
+    saveState();
+    sendTelegram(buildDailySummaryText());
+  }
+}
+
 // ---------------- دستورات و دکمه‌های تلگرام ----------------
 let telegramOffset = 0;
 
@@ -576,6 +724,17 @@ function helpText() {
     "/alerts [SYMBOL] — لیست آلارم‌های قیمت (با دکمه‌ی حذف)\n" +
     "/delalert <SYMBOL> [قیمت] — حذف آلارم (بدون قیمت = همه‌ی آلارم‌های اون کوین)\n" +
     "/report <SYMBOL> [روز] — گزارش هشدارهای یک کوین (پیش‌فرض ۳۰ روز)\n" +
+    "/dynamic on|off — فعال/غیرفعال‌کردن آستانه‌ی پویا (بر اساس نوسان معمول هر کوین)\n" +
+    "/dynamicfactor <عدد> — ضریب آستانه‌ی پویا (پیش‌فرض 0.4)\n" +
+    "/volumealert on|off — فعال/غیرفعال‌کردن هشدار جهش حجم معاملات\n" +
+    "/volumefactor <عدد> — چند برابر حجم معمول، جهش حساب بشه (پیش‌فرض 2.5)\n" +
+    "/mute <SYMBOL> <مدت> — سکوت موقت یه کوین، مثلاً /mute DOGE 6h یا /mute DOGE 30m\n" +
+    "/unmute <SYMBOL> — لغو سکوت\n" +
+    "/mutes — نمایش کوین‌های ساکت‌شده\n" +
+    "/export [روز] — خروجی CSV از تاریخچه (پیش‌فرض ۳۰ روز)\n" +
+    "/dailysummary on|off — فعال/غیرفعال‌کردن خلاصه‌ی روزانه\n" +
+    "/summaryhour <۰ تا ۲۳> — ساعت ارسال خلاصه‌ی روزانه (به وقت ایران)\n" +
+    "/summarynow — ارسال فوری خلاصه (برای تست)\n" +
     "/help — همین راهنما";
 }
 function statusText() {
@@ -584,6 +743,8 @@ function statusText() {
     `آستانه‌ی پامپ: ${state.threshold}٪ | آستانه‌ی افت: ${state.dumpThreshold}٪\n` +
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
     `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length} | آلارم قیمت: ${state.priceAlerts.length}\n` +
+    `آستانه‌ی پویا: ${state.dynamicEnabled ? "فعال (ضریب " + state.dynamicFactor + ")" : "غیرفعال"} | هشدار حجم: ${state.volumeAlertEnabled ? "فعال (×" + state.volumeSpikeMultiplier + ")" : "غیرفعال"}\n` +
+    `کوین‌های ساکت‌شده: ${state.mutes.length} | خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "ساعت " + state.dailySummaryHour + " (ایران)" : "غیرفعال"}\n` +
     `آخرین بروزرسانی: ${lastPollAt ? fmtTimeOnly(lastPollAt) : "—"}`;
 }
 function historyText() {
@@ -684,6 +845,82 @@ async function handleCommand(text) {
     return;
   }
   if (cmd === "/blacklistshow") { sendTelegram("🚫 لیست سیاه:\n" + state.blacklist.join("، ")); return; }
+
+  if (cmd === "/dynamic") {
+    if (parts[1] === "on") { state.dynamicEnabled = true; saveState(); sendTelegram("✅ آستانه‌ی پویا فعال شد."); }
+    else if (parts[1] === "off") { state.dynamicEnabled = false; saveState(); sendTelegram("⏹ آستانه‌ی پویا غیرفعال شد."); }
+    else sendTelegram("مثال: /dynamic on   یا   /dynamic off");
+    return;
+  }
+  if (cmd === "/dynamicfactor") {
+    const v = parseFloat(parts[1]);
+    if (!isNaN(v) && v > 0) { state.dynamicFactor = v; saveState(); sendTelegram(`✅ ضریب آستانه‌ی پویا روی ${v} تنظیم شد.`); }
+    else sendTelegram("عدد نامعتبر. مثال: /dynamicfactor 0.5");
+    return;
+  }
+  if (cmd === "/volumealert") {
+    if (parts[1] === "on") { state.volumeAlertEnabled = true; saveState(); sendTelegram("✅ هشدار جهش حجم فعال شد."); }
+    else if (parts[1] === "off") { state.volumeAlertEnabled = false; saveState(); sendTelegram("⏹ هشدار جهش حجم غیرفعال شد."); }
+    else sendTelegram("مثال: /volumealert on   یا   /volumealert off");
+    return;
+  }
+  if (cmd === "/volumefactor") {
+    const v = parseFloat(parts[1]);
+    if (!isNaN(v) && v > 1) { state.volumeSpikeMultiplier = v; saveState(); sendTelegram(`✅ ضریب جهش حجم روی ${v}× تنظیم شد.`); }
+    else sendTelegram("عدد نامعتبر (باید بزرگ‌تر از ۱ باشه). مثال: /volumefactor 3");
+    return;
+  }
+
+  if (cmd === "/mute") {
+    if (!parts[1] || !parts[2]) { sendTelegram("مثال: /mute DOGE 6h   یا   /mute DOGE 30m   یا   /mute DOGE 1d"); return; }
+    const ms = parseDuration(parts[2]);
+    if (!ms) { sendTelegram("مدت نامعتبر. نمونه‌ها: 30m، 6h، 1d"); return; }
+    const found = await resolveSymbolToId(parts[1]);
+    if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
+    state.mutes = state.mutes.filter((mm) => mm.id !== found.id);
+    const until = Date.now() + ms;
+    state.mutes.push({ id: found.id, symbol: found.symbol, until });
+    saveState();
+    sendTelegram(`🔇 ${found.symbol.toUpperCase()} تا ${fmtDateTime(until)} ساکت شد (پامپ/دامپ/حجم؛ آلارم قیمت دستی همچنان فعاله).`);
+    return;
+  }
+  if (cmd === "/unmute") {
+    if (!parts[1]) { sendTelegram("مثال: /unmute DOGE"); return; }
+    const sym = parts[1].toUpperCase();
+    const before = state.mutes.length;
+    state.mutes = state.mutes.filter((mm) => mm.symbol.toUpperCase() !== sym);
+    saveState();
+    sendTelegram(state.mutes.length < before ? `${sym} از سکوت خارج شد.` : "این کوین ساکت نبود.");
+    return;
+  }
+  if (cmd === "/mutes") {
+    cleanupMutes(Date.now());
+    sendTelegram(state.mutes.length
+      ? "🔇 کوین‌های ساکت‌شده:\n" + state.mutes.map((mm) => `${mm.symbol.toUpperCase()} تا ${fmtDateTime(mm.until)}`).join("\n")
+      : "هیچ کوینی ساکت نیست.");
+    return;
+  }
+
+  if (cmd === "/export") {
+    const days = parseFloat(parts[1]) || 30;
+    sendTelegram("در حال آماده‌سازی فایل CSV...");
+    await sendCsvExport(days);
+    return;
+  }
+
+  if (cmd === "/dailysummary") {
+    if (parts[1] === "on") { state.dailySummaryEnabled = true; saveState(); sendTelegram("✅ خلاصه‌ی روزانه فعال شد."); }
+    else if (parts[1] === "off") { state.dailySummaryEnabled = false; saveState(); sendTelegram("⏹ خلاصه‌ی روزانه غیرفعال شد."); }
+    else sendTelegram("مثال: /dailysummary on   یا   /dailysummary off");
+    return;
+  }
+  if (cmd === "/summaryhour") {
+    const v = parseInt(parts[1], 10);
+    if (!isNaN(v) && v >= 0 && v <= 23) { state.dailySummaryHour = v; saveState(); sendTelegram(`✅ ساعت خلاصه‌ی روزانه روی ${v}:00 (ایران) تنظیم شد.`); }
+    else sendTelegram("عدد نامعتبر (باید بین ۰ تا ۲۳ باشه). مثال: /summaryhour 9");
+    return;
+  }
+  if (cmd === "/summarynow") { sendTelegram(buildDailySummaryText()); return; }
 }
 
 async function handleCallback(cq) {
@@ -742,6 +979,7 @@ function start() {
   pollOnce();
   setInterval(pollOnce, POLL_SECONDS * 1000);
   setInterval(pollTelegramCommands, 4000);
+  setInterval(checkDailySummary, 60000);
 }
 start();
 
