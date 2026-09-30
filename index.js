@@ -26,6 +26,9 @@ const TIMEZONE = process.env.TIMEZONE || "Asia/Tehran";
 const DYNAMIC_THRESHOLD_FACTOR_DEFAULT = parseFloat(process.env.DYNAMIC_THRESHOLD_FACTOR || "0.4");
 const VOLUME_SPIKE_MULTIPLIER_DEFAULT = parseFloat(process.env.VOLUME_SPIKE_MULTIPLIER || "2.5");
 const DAILY_SUMMARY_HOUR_DEFAULT = parseInt(process.env.DAILY_SUMMARY_HOUR || "9", 10);
+const MARKET_WIDE_THRESHOLD_DEFAULT = parseFloat(process.env.MARKET_WIDE_THRESHOLD || "2.5");
+const BREAKOUT_MIN_PERCENT_DEFAULT = parseFloat(process.env.BREAKOUT_MIN_PERCENT || "1");
+const BTC_ID = "bitcoin";
 const ENV_BLACKLIST = (process.env.BLACKLIST_IDS || "").split(",").map((s)=>s.trim()).filter(Boolean);
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
@@ -34,7 +37,7 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 // ---------------- حالت قابل‌تغییر + ذخیره‌سازی ----------------
-const STATE_DIR = process.env.STATE_DIR || __dirname; // اگه Volume وصل کردی، این رو به مسیرش تنظیم کن
+const STATE_DIR = process.env.STATE_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname; // اگه Volume وصل باشه، خودکار همون مسیر استفاده می‌شه
 const STATE_FILE = path.join(STATE_DIR, "state.json");
 let state = {
   threshold: parseFloat(process.env.THRESHOLD_PERCENT || "5"),
@@ -53,6 +56,10 @@ let state = {
   dailySummaryEnabled: true,
   dailySummaryHour: DAILY_SUMMARY_HOUR_DEFAULT,
   lastSummaryDate: null,
+  marketWideThreshold: MARKET_WIDE_THRESHOLD_DEFAULT,
+  newEntrantEnabled: true,
+  breakoutAlertEnabled: true,
+  breakoutMinPercent: BREAKOUT_MIN_PERCENT_DEFAULT,
 };
 function loadState() {
   try {
@@ -73,6 +80,9 @@ const meta = new Map();
 const notifiedPump = new Map();
 const notifiedDump = new Map();
 const notifiedVolume = new Map();
+const prevExtremes = new Map(); // id -> {high, low}  (برای تشخیص شکست سقف/کف ۲۴ ساعته)
+let previousTopIds = new Set();  // برای تشخیص ورود تازه به لیست برتر
+let topBaselineEstablished = false;
 const volatilityEma = new Map();  // id -> EMA میانگین قدرمطلق تغییر ۲۴ ساعته (شاخص نوسان معمول کوین)
 const volumeEma = new Map();      // id -> EMA حجم ۲۴ ساعته (پایه برای تشخیص جهش حجم)
 const sampleCount = new Map();    // id -> تعداد نمونه‌ی دیده‌شده (برای اطمینان از پایدار بودن EMA)
@@ -157,34 +167,52 @@ async function trendConfirmation(id, direction) {
 }
 
 // ---------------- امتیاز اطمینان ----------------
-function confidenceScore(m, changeAbs, trend) {
+function confidenceScore(m, changeAbs, trend, marketCtx) {
   let score = 0;
-  if (m.volume >= MIN_VOLUME_USD * 5) score += 25;
-  else if (m.volume >= MIN_VOLUME_USD * 2) score += 12;
+  if (m.volume >= MIN_VOLUME_USD * 5) score += 20;
+  else if (m.volume >= MIN_VOLUME_USD * 2) score += 10;
 
-  if (m.rank && m.rank <= 100) score += 25;
-  else if (m.rank && m.rank <= 300) score += 12;
-  else if (m.rank && m.rank <= 500) score += 5;
+  if (m.rank && m.rank <= 100) score += 20;
+  else if (m.rank && m.rank <= 300) score += 10;
+  else if (m.rank && m.rank <= 500) score += 4;
 
   if (m.marketCap && m.marketCap > 0) {
     const turnover = m.volume / m.marketCap;
-    if (turnover > 0.15) score += 15;
-    else if (turnover > 0.07) score += 8;
+    if (turnover > 0.15) score += 12;
+    else if (turnover > 0.07) score += 6;
   }
 
-  if (changeAbs >= 5 && changeAbs <= 25) score += 15;
-  else if (changeAbs > 25) score += 6;
+  if (changeAbs >= 5 && changeAbs <= 25) score += 12;
+  else if (changeAbs > 25) score += 5;
 
   let trendLine = "روند ۴ ساعته: نامشخص";
   if (trend && trend.known) {
-    if (trend.aligned) { score += 20; trendLine = "روند ۴ ساعته: هم‌جهت ✅"; }
-    else if (trend.opposite) { score -= 10; trendLine = "روند ۴ ساعته: مخالف ⚠️"; }
+    if (trend.aligned) { score += 16; trendLine = "روند ۴ ساعته: هم‌جهت ✅"; }
+    else if (trend.opposite) { score -= 8; trendLine = "روند ۴ ساعته: مخالف ⚠️"; }
     else trendLine = "روند ۴ ساعته: مبهم";
+  }
+
+  let marketLine = null;
+  if (marketCtx && marketCtx.known) {
+    if (marketCtx.correlated) { score -= 12; marketLine = "وضعیت بازار: هم‌جهت با کل بازار ⚠️"; }
+    else { score += 8; marketLine = "وضعیت بازار: مستقل از بازار ✅"; }
   }
 
   score = Math.max(0, Math.min(100, score));
   const label = score >= 70 ? "قوی 🟢" : score >= 40 ? "متوسط 🟡" : "ضعیف 🔴";
-  return { score, label, trendLine };
+  return { score, label, trendLine, marketLine };
+}
+function getMarketContext(id, coinChangeAbs, direction) {
+  if (id === BTC_ID) return null; // مقایسه‌ی بیت‌کوین با خودش بی‌معنیه
+  const btcArr = history.get(BTC_ID);
+  if (!btcArr || btcArr.length < 2) return { known: false };
+  const btcChanges = computeChanges(btcArr, Date.now());
+  const vals = Object.values(btcChanges).filter((v) => v != null);
+  if (!vals.length) return { known: false };
+  const btcMove = direction === "up" ? Math.max.apply(null, vals) : Math.min.apply(null, vals);
+  const sameDirection = direction === "up" ? btcMove > 0 : btcMove < 0;
+  const correlated = sameDirection && Math.abs(btcMove) >= state.marketWideThreshold;
+  return { known: true, correlated, btcMove };
 }
 
 // ---------------- دریافت داده‌ی بازار ----------------
@@ -292,6 +320,70 @@ function parseDuration(text) {
   return ms > 0 ? ms : null;
 }
 
+// ---------------- ورود تازه به لیست برتر ----------------
+function checkNewEntrants(rankedIds) {
+  if (topBaselineEstablished && state.newEntrantEnabled) {
+    for (const id of rankedIds) {
+      if (previousTopIds.has(id)) continue;
+      if (state.blacklist.includes(id)) continue;
+      const now = Date.now();
+      if (isMuted(id, now)) continue;
+      const m = meta.get(id);
+      if (!m) continue;
+      sendTelegram(
+        `🆕 ورود تازه به لیست برتر: ${m.symbol.toUpperCase()} (${m.name})\n` +
+        `رتبه‌ی فعلی: #${m.rank || "—"}\n` +
+        `قیمت: $${fmtPrice(history.get(id) ? history.get(id).slice(-1)[0].p : null)}\n` +
+        `حجم ۲۴ ساعته: $${fmtNum(m.volume)}\n` +
+        `ممکنه نشونه‌ی یه رشد یا لیستینگ مهم باشه.`,
+        [[{ text: "📈 نمودار", url: chartLink(id) }]]
+      );
+      pushHistoryLog("ورود", m.symbol.toUpperCase(), m.name, `${m.symbol.toUpperCase()} وارد لیست برتر شد (#${m.rank})`, id, null, null);
+      console.log(`[NEW ENTRANT] ${m.symbol.toUpperCase()} #${m.rank}`);
+    }
+  }
+  previousTopIds = new Set(rankedIds);
+  topBaselineEstablished = true;
+}
+
+// ---------------- شکست سقف/کف ۲۴ ساعته ----------------
+function checkBreakout(c, now, isWatched) {
+  if (!state.breakoutAlertEnabled) return;
+  if (state.blacklist.includes(c.id) || isMuted(c.id, now)) return;
+  if (!isWatched && (c.total_volume || 0) < MIN_VOLUME_USD) return;
+  const newHigh = c.high_24h, newLow = c.low_24h;
+  const prev = prevExtremes.get(c.id);
+  if (prev) {
+    if (newHigh != null && prev.high != null && newHigh > prev.high) {
+      const pct = ((newHigh - prev.high) / prev.high) * 100;
+      if (pct >= state.breakoutMinPercent) {
+        sendTelegram(
+          `${PUMP_ICON1} شکست سقف ۲۴ ساعته: ${c.symbol.toUpperCase()} (${c.name})\n` +
+          `سقف قبلی: $${fmtPrice(prev.high)} ← سقف جدید: $${fmtPrice(newHigh)} (+${pct.toFixed(1)}٪)\n` +
+          `قیمت فعلی: $${fmtPrice(c.current_price)}`,
+          [[{ text: "📈 نمودار", url: chartLink(c.id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + c.id }]]
+        );
+        pushHistoryLog("شکست", c.symbol.toUpperCase(), c.name, `${c.symbol.toUpperCase()} شکست سقف (+${pct.toFixed(1)}٪)`, c.id, c.current_price, pct);
+        console.log(`[BREAKOUT-UP] ${c.symbol.toUpperCase()} +${pct.toFixed(1)}%`);
+      }
+    }
+    if (newLow != null && prev.low != null && newLow < prev.low) {
+      const pct = ((prev.low - newLow) / prev.low) * 100;
+      if (pct >= state.breakoutMinPercent) {
+        sendTelegram(
+          `${DUMP_ICON1} شکست کف ۲۴ ساعته: ${c.symbol.toUpperCase()} (${c.name})\n` +
+          `کف قبلی: $${fmtPrice(prev.low)} ← کف جدید: $${fmtPrice(newLow)} (-${pct.toFixed(1)}٪)\n` +
+          `قیمت فعلی: $${fmtPrice(c.current_price)}`,
+          [[{ text: "📈 نمودار", url: chartLink(c.id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + c.id }]]
+        );
+        pushHistoryLog("شکست", c.symbol.toUpperCase(), c.name, `${c.symbol.toUpperCase()} شکست کف (-${pct.toFixed(1)}٪)`, c.id, c.current_price, -pct);
+        console.log(`[BREAKOUT-DOWN] ${c.symbol.toUpperCase()} -${pct.toFixed(1)}%`);
+      }
+    }
+  }
+  prevExtremes.set(c.id, { high: newHigh, low: newLow });
+}
+
 // ---------------- ارزیابی و اطلاع‌رسانی ----------------
 async function evaluate(now) {
   const watchIds = new Set(state.watchlist.map((w) => w.id));
@@ -318,7 +410,8 @@ async function evaluate(now) {
       if (!wasPump) {
         notifiedPump.set(id, true);
         const trend = await trendConfirmation(id, "up");
-        const conf = confidenceScore(m, maxChange, trend);
+        const marketCtx = getMarketContext(id, maxChange, "up");
+        const conf = confidenceScore(m, maxChange, trend, marketCtx);
         const lines = pumpWindows.map((w) => `${PUMP_ICON} ${w} دقیقه: +${changes[w].toFixed(1)}٪`).join("\n");
         const label = `${m.symbol.toUpperCase()} +${maxChange.toFixed(1)}٪`;
         sendTelegram(
@@ -326,6 +419,7 @@ async function evaluate(now) {
           `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
+          (conf.marketLine ? `${conf.marketLine}\n` : "") +
           `اطمینان: ${conf.label} (${conf.score}/100)`,
           [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
         );
@@ -342,7 +436,8 @@ async function evaluate(now) {
       if (!wasDump) {
         notifiedDump.set(id, true);
         const trend = await trendConfirmation(id, "down");
-        const conf = confidenceScore(m, Math.abs(minChange), trend);
+        const marketCtx = getMarketContext(id, Math.abs(minChange), "down");
+        const conf = confidenceScore(m, Math.abs(minChange), trend, marketCtx);
         const lines = dumpWindows.map((w) => `${DUMP_ICON} ${w} دقیقه: ${changes[w].toFixed(1)}٪`).join("\n");
         const label = `${m.symbol.toUpperCase()} ${minChange.toFixed(1)}٪`;
         sendTelegram(
@@ -350,6 +445,7 @@ async function evaluate(now) {
           `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
+          (conf.marketLine ? `${conf.marketLine}\n` : "") +
           `اطمینان: ${conf.label} (${conf.score}/100)`,
           [[{ text: "📈 نمودار", url: chartLink(id) }, { text: "🚫 مسدود کن", callback_data: "blacklist:" + id }]]
         );
@@ -395,6 +491,7 @@ async function pollOnce() {
   const now = Date.now();
   const seen = new Set();
   try {
+    const rankedIds = [];
     if (!state.paused) {
       for (let p = 1; p <= PAGES; p++) {
         const coins = await fetchMarketsPage(p);
@@ -403,10 +500,13 @@ async function pollOnce() {
           meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
           pushPrice(c.id, c.current_price, now);
           updateBaselines(c, now);
+          checkBreakout(c, now, state.watchlist.some((w) => w.id === c.id));
           seen.add(c.id);
+          rankedIds.push(c.id);
         }
         if (p < PAGES) await sleep(2000);
       }
+      checkNewEntrants(rankedIds);
     }
     // کوین‌هایی که آلارم قیمت یا واچ‌لیست دارن ولی توی صفحات بالا نبودن، هر بار جدا به‌روز می‌شن
     const wanted = new Set(state.priceAlerts.map((a) => a.coinId));
@@ -420,6 +520,7 @@ async function pollOnce() {
         meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
         pushPrice(c.id, c.current_price, now);
         updateBaselines(c, now);
+        checkBreakout(c, now, true); // این حلقه فقط برای واچ‌لیست/کوین‌های گم‌شده‌ست
         seen.add(c.id);
       }
     }
@@ -605,7 +706,7 @@ async function coinReport(symbolRaw, days) {
   text += "\n";
 
   const lines = items.slice(0, 15).map((h) => {
-    const icon = h.type === "پامپ" ? PUMP_ICON1 : h.type === "دامپ" ? DUMP_ICON1 : "🔔";
+    const icon = h.type === "پامپ" ? PUMP_ICON1 : h.type === "دامپ" ? DUMP_ICON1 : h.type === "ورود" ? "🆕" : h.type === "شکست" ? ((h.changePct || 0) >= 0 ? PUMP_ICON1 : DUMP_ICON1) : "🔔";
     let outcome = "";
     if (h.type !== "قیمت" && current != null && h.price) {
       const pct = ((current - h.price) / h.price) * 100;
@@ -695,8 +796,11 @@ function buildDailySummaryText() {
   const dumps = items.filter((h) => h.type === "دامپ");
   const vols = items.filter((h) => h.type === "حجم");
   const priceHits = items.filter((h) => h.type === "قیمت");
+  const entrants = items.filter((h) => h.type === "ورود");
+  const breakouts = items.filter((h) => h.type === "شکست");
   let text = "🗓 خلاصه‌ی ۲۴ ساعت اخیر\n\n";
   text += `${PUMP_ICON1} پامپ: ${pumps.length} | ${DUMP_ICON1} دامپ: ${dumps.length} | 📢 جهش حجم: ${vols.length} | 🔔 آلارم قیمت: ${priceHits.length}\n`;
+  text += `🆕 ورود تازه: ${entrants.length} | 📊 شکست سقف/کف: ${breakouts.length}\n`;
   const topPump = pumps.slice().sort((a, b) => (b.changePct || 0) - (a.changePct || 0))[0];
   const topDump = dumps.slice().sort((a, b) => (a.changePct || 0) - (b.changePct || 0))[0];
   const topVol = vols.slice().sort((a, b) => (b.changePct || 0) - (a.changePct || 0))[0];
@@ -784,11 +888,15 @@ function menuAdvanced() {
     text: "⚙️ تنظیمات پیشرفته\n\n" +
       `آستانه‌ی پویا: ${state.dynamicEnabled ? "فعال ✅" : "غیرفعال ⏹"} (ضریب ${state.dynamicFactor})\n` +
       `هشدار جهش حجم: ${state.volumeAlertEnabled ? "فعال ✅" : "غیرفعال ⏹"} (×${state.volumeSpikeMultiplier})\n` +
-      `خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "فعال ✅ (ساعت " + state.dailySummaryHour + ")" : "غیرفعال ⏹"}`,
+      `خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "فعال ✅ (ساعت " + state.dailySummaryHour + ")" : "غیرفعال ⏹"}\n` +
+      `ورود تازه به لیست برتر: ${state.newEntrantEnabled ? "فعال ✅" : "غیرفعال ⏹"}\n` +
+      `شکست سقف/کف ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال ✅ (" + state.breakoutMinPercent + "٪)" : "غیرفعال ⏹"}`,
     keyboard: [
       [{ text: state.dynamicEnabled ? "⏹ خاموش‌کردن آستانه‌ی پویا" : "✅ روشن‌کردن آستانه‌ی پویا", callback_data: "toggle:dynamicEnabled:advanced" }],
       [{ text: state.volumeAlertEnabled ? "⏹ خاموش‌کردن هشدار حجم" : "✅ روشن‌کردن هشدار حجم", callback_data: "toggle:volumeAlertEnabled:advanced" }],
       [{ text: state.dailySummaryEnabled ? "⏹ خاموش‌کردن خلاصه‌ی روزانه" : "✅ روشن‌کردن خلاصه‌ی روزانه", callback_data: "toggle:dailySummaryEnabled:advanced" }],
+      [{ text: state.newEntrantEnabled ? "⏹ خاموش‌کردن ورود تازه" : "✅ روشن‌کردن ورود تازه", callback_data: "toggle:newEntrantEnabled:advanced" }],
+      [{ text: state.breakoutAlertEnabled ? "⏹ خاموش‌کردن شکست سقف/کف" : "✅ روشن‌کردن شکست سقف/کف", callback_data: "toggle:breakoutAlertEnabled:advanced" }],
       [{ text: "🔙 منو", callback_data: "menu:main" }],
     ],
   };
@@ -846,6 +954,10 @@ function helpText() {
     "/dailysummary on|off — فعال/غیرفعال‌کردن خلاصه‌ی روزانه\n" +
     "/summaryhour <۰ تا ۲۳> — ساعت ارسال خلاصه‌ی روزانه (به وقت ایران)\n" +
     "/summarynow — ارسال فوری خلاصه (برای تست)\n" +
+    "/marketwide <عدد> — آستانه‌ی «حرکت کل بازار» برای تشخیص هم‌جهتی با بیت‌کوین (پیش‌فرض 2.5)\n" +
+    "/newentrant on|off — روشن/خاموش‌کردن هشدار ورود به لیست برتر\n" +
+    "/breakout on|off — روشن/خاموش‌کردن هشدار شکست سقف/کف ۲۴ ساعته\n" +
+    "/breakoutfactor <عدد> — حداقل درصد تغییر برای حساب‌شدن به‌عنوان شکست (پیش‌فرض 1)\n" +
     "/help — همین راهنما";
 }
 function statusText() {
@@ -856,13 +968,14 @@ function statusText() {
     `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length} | آلارم قیمت: ${state.priceAlerts.length}\n` +
     `آستانه‌ی پویا: ${state.dynamicEnabled ? "فعال (ضریب " + state.dynamicFactor + ")" : "غیرفعال"} | هشدار حجم: ${state.volumeAlertEnabled ? "فعال (×" + state.volumeSpikeMultiplier + ")" : "غیرفعال"}\n` +
     `کوین‌های ساکت‌شده: ${state.mutes.length} | خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "ساعت " + state.dailySummaryHour + " (ایران)" : "غیرفعال"}\n` +
+    `فیلتر بازار: آستانه ${state.marketWideThreshold}٪ | ورود تازه: ${state.newEntrantEnabled ? "فعال" : "غیرفعال"} | شکست ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال (" + state.breakoutMinPercent + "٪)" : "غیرفعال"}\n` +
     `آخرین بروزرسانی: ${lastPollAt ? fmtTimeOnly(lastPollAt) : "—"}`;
 }
 function historyText() {
   if (!state.history.length) return "هنوز هشداری ثبت نشده.";
   return "🕘 آخرین هشدارها:\n" + state.history.slice(0, 10).map((h) => {
     const time = fmtDateTime(h.t);
-    const icon = h.type === "پامپ" ? PUMP_ICON1 : h.type === "دامپ" ? DUMP_ICON1 : "🔔";
+    const icon = h.type === "پامپ" ? PUMP_ICON1 : h.type === "دامپ" ? DUMP_ICON1 : h.type === "ورود" ? "🆕" : h.type === "شکست" ? ((h.changePct || 0) >= 0 ? PUMP_ICON1 : DUMP_ICON1) : "🔔";
     return `${icon} ${h.detail} — ${time}`;
   }).join("\n");
 }
@@ -1033,6 +1146,31 @@ async function handleCommand(text) {
     return;
   }
   if (cmd === "/summarynow") { sendTelegram(buildDailySummaryText()); return; }
+
+  if (cmd === "/marketwide") {
+    const v = parseFloat(parts[1]);
+    if (!isNaN(v) && v > 0) { state.marketWideThreshold = v; saveState(); sendTelegram(`✅ آستانه‌ی حرکت کل بازار روی ${v}٪ تنظیم شد.`); }
+    else sendTelegram("عدد نامعتبر. مثال: /marketwide 3");
+    return;
+  }
+  if (cmd === "/newentrant") {
+    if (parts[1] === "on") { state.newEntrantEnabled = true; saveState(); sendTelegram("✅ هشدار ورود به لیست برتر فعال شد."); }
+    else if (parts[1] === "off") { state.newEntrantEnabled = false; saveState(); sendTelegram("⏹ هشدار ورود به لیست برتر غیرفعال شد."); }
+    else sendTelegram("مثال: /newentrant on   یا   /newentrant off");
+    return;
+  }
+  if (cmd === "/breakout") {
+    if (parts[1] === "on") { state.breakoutAlertEnabled = true; saveState(); sendTelegram("✅ هشدار شکست سقف/کف فعال شد."); }
+    else if (parts[1] === "off") { state.breakoutAlertEnabled = false; saveState(); sendTelegram("⏹ هشدار شکست سقف/کف غیرفعال شد."); }
+    else sendTelegram("مثال: /breakout on   یا   /breakout off");
+    return;
+  }
+  if (cmd === "/breakoutfactor") {
+    const v = parseFloat(parts[1]);
+    if (!isNaN(v) && v > 0) { state.breakoutMinPercent = v; saveState(); sendTelegram(`✅ حداقل درصد شکست روی ${v}٪ تنظیم شد.`); }
+    else sendTelegram("عدد نامعتبر. مثال: /breakoutfactor 1.5");
+    return;
+  }
 }
 
 async function handleCallback(cq) {
@@ -1147,6 +1285,10 @@ const BOT_COMMANDS = [
   { command: "dailysummary", description: "روشن/خاموش‌کردن خلاصه‌ی روزانه" },
   { command: "summaryhour", description: "ساعت ارسال خلاصه‌ی روزانه" },
   { command: "summarynow", description: "ارسال فوری خلاصه‌ی روزانه" },
+  { command: "marketwide", description: "آستانه‌ی هم‌جهتی با کل بازار" },
+  { command: "newentrant", description: "روشن/خاموش ورود به لیست برتر" },
+  { command: "breakout", description: "روشن/خاموش شکست سقف/کف" },
+  { command: "breakoutfactor", description: "حداقل درصد شکست سقف/کف" },
 ];
 async function registerBotUI() {
   try {
