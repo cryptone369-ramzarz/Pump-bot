@@ -34,7 +34,8 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 }
 
 // ---------------- حالت قابل‌تغییر + ذخیره‌سازی ----------------
-const STATE_FILE = path.join(__dirname, "state.json");
+const STATE_DIR = process.env.STATE_DIR || __dirname; // اگه Volume وصل کردی، این رو به مسیرش تنظیم کن
+const STATE_FILE = path.join(STATE_DIR, "state.json");
 let state = {
   threshold: parseFloat(process.env.THRESHOLD_PERCENT || "5"),
   dumpThreshold: -Math.abs(parseFloat(process.env.DUMP_THRESHOLD_PERCENT || "5")),
@@ -60,8 +61,10 @@ function loadState() {
   } catch (e) { console.log("فایل تنظیمات قبلی پیدا نشد؛ از مقادیر پیش‌فرض استفاده می‌شه."); }
 }
 function saveState() {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2)); }
-  catch (e) { console.error("خطا در ذخیره‌ی تنظیمات:", e.message); }
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (e) { console.error("خطا در ذخیره‌ی تنظیمات:", e.message); }
 }
 loadState();
 
@@ -1112,6 +1115,56 @@ async function pollTelegramCommands() {
   }
 }
 
+// ---------------- دکمه‌ی منوی تلگرام ----------------
+const BOT_COMMANDS = [
+  { command: "menu", description: "منوی دکمه‌ای همه‌ی بخش‌ها" },
+  { command: "status", description: "وضعیت فعلی ربات" },
+  { command: "help", description: "راهنمای کامل دستورات" },
+  { command: "threshold", description: "تغییر آستانه‌ی پامپ" },
+  { command: "dumpthreshold", description: "تغییر آستانه‌ی افت" },
+  { command: "pause", description: "توقف موقت رصد پامپ/دامپ" },
+  { command: "resume", description: "از سرگیری رصد" },
+  { command: "watch", description: "افزودن کوین به واچ‌لیست" },
+  { command: "unwatch", description: "حذف از واچ‌لیست" },
+  { command: "watchlist", description: "نمایش واچ‌لیست" },
+  { command: "blacklist", description: "مسدودکردن یه کوین" },
+  { command: "unblacklist", description: "حذف از لیست سیاه" },
+  { command: "blacklistshow", description: "نمایش لیست سیاه" },
+  { command: "alert", description: "ثبت آلارم قیمت" },
+  { command: "alerts", description: "نمایش آلارم‌های قیمت" },
+  { command: "delalert", description: "حذف آلارم قیمت" },
+  { command: "report", description: "گزارش یه کوین خاص" },
+  { command: "history", description: "آخرین هشدارها" },
+  { command: "backtest", description: "بک‌تست هشدارهای گذشته" },
+  { command: "dynamic", description: "روشن/خاموش‌کردن آستانه‌ی پویا" },
+  { command: "dynamicfactor", description: "ضریب آستانه‌ی پویا" },
+  { command: "volumealert", description: "روشن/خاموش‌کردن هشدار حجم" },
+  { command: "volumefactor", description: "ضریب جهش حجم" },
+  { command: "mute", description: "سکوت موقت یه کوین" },
+  { command: "unmute", description: "لغو سکوت" },
+  { command: "mutes", description: "نمایش کوین‌های ساکت‌شده" },
+  { command: "export", description: "خروجی CSV از تاریخچه" },
+  { command: "dailysummary", description: "روشن/خاموش‌کردن خلاصه‌ی روزانه" },
+  { command: "summaryhour", description: "ساعت ارسال خلاصه‌ی روزانه" },
+  { command: "summarynow", description: "ارسال فوری خلاصه‌ی روزانه" },
+];
+async function registerBotUI() {
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ commands: BOT_COMMANDS }),
+    });
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setChatMenuButton`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, menu_button: { type: "commands" } }),
+    });
+  } catch (e) {
+    console.error("خطا در ثبت دکمه‌ی منوی تلگرام:", e.message);
+  }
+}
+
 // ---------------- شروع ----------------
 let started = false;
 function start() {
@@ -1123,6 +1176,7 @@ function start() {
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
     `برای دیدن دستورات: /help`
   );
+  registerBotUI();
   pollOnce();
   setInterval(pollOnce, POLL_SECONDS * 1000);
   setInterval(pollTelegramCommands, 4000);
