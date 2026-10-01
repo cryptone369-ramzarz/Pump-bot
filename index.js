@@ -210,7 +210,7 @@ function getMarketContext(id, coinChangeAbs, direction) {
   if (id === BTC_ID) return null; // مقایسه‌ی بیت‌کوین با خودش بی‌معنیه
   const btcArr = history.get(BTC_ID);
   if (!btcArr || btcArr.length < 2) return { known: false };
-  const btcChanges = computeChanges(btcArr, Date.now());
+  const { changes: btcChanges } = computeChanges(btcArr, Date.now());
   const vals = Object.values(btcChanges).filter((v) => v != null);
   if (!vals.length) return { known: false };
   const btcMove = direction === "up" ? Math.max.apply(null, vals) : Math.min.apply(null, vals);
@@ -263,6 +263,7 @@ function pushPrice(id, price, now) {
 }
 function computeChanges(arr, now) {
   const changes = {};
+  const bases = {};
   for (const w of WINDOWS_MINUTES) {
     const windowMs = w * 60 * 1000;
     let base = arr[0];
@@ -271,8 +272,9 @@ function computeChanges(arr, now) {
       base = arr[i];
     }
     changes[w] = (base && base.p > 0) ? ((arr[arr.length - 1].p - base.p) / base.p) * 100 : null;
+    bases[w] = base;
   }
-  return changes;
+  return { changes, bases };
 }
 function pushHistoryLog(type, symbol, name, detail, id, price, changePct) {
   state.history.unshift({ t: Date.now(), type, symbol, name, detail, id, price, changePct });
@@ -459,12 +461,13 @@ async function evaluate(now) {
     if (isMuted(id, now)) continue; // این کوین موقتاً ساکت شده
 
     const eff = effectiveThresholds(id);
-    const changes = computeChanges(arr, now);
+    const { changes, bases } = computeChanges(arr, now);
     const vals = Object.values(changes).filter((v) => v != null);
     if (!vals.length) continue;
     const maxChange = Math.max.apply(null, vals);
     const minChange = Math.min.apply(null, vals);
     const latestPrice = arr[arr.length - 1].p;
+    const nowTimeStr = fmtTimeOnly(now);
 
     const pumpWindows = WINDOWS_MINUTES.filter((w) => changes[w] != null && changes[w] >= eff.pump);
     const wasPump = notifiedPump.get(id) || false;
@@ -474,11 +477,15 @@ async function evaluate(now) {
         const trend = await trendConfirmation(id, "up");
         const marketCtx = getMarketContext(id, maxChange, "up");
         const conf = confidenceScore(m, maxChange, trend, marketCtx);
-        const lines = pumpWindows.map((w) => `${PUMP_ICON} ${w} دقیقه: +${changes[w].toFixed(1)}٪`).join("\n");
+        const lines = pumpWindows.map((w) => {
+          const b = bases[w];
+          return `${PUMP_ICON} ${w} دقیقه: +${changes[w].toFixed(1)}٪\n` +
+            `   $${fmtPrice(b.p)} (${fmtTimeOnly(b.t)}) ← $${fmtPrice(latestPrice)} (${nowTimeStr})`;
+        }).join("\n");
         const label = `${m.symbol.toUpperCase()} +${maxChange.toFixed(1)}٪`;
         sendTelegram(
           `${PUMP_ICON} پامپ شناسایی شد: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
-          `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
+          `قیمت فعلی: $${fmtPrice(latestPrice)} (${nowTimeStr})\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
           (conf.marketLine ? `${conf.marketLine}\n` : "") +
@@ -500,11 +507,15 @@ async function evaluate(now) {
         const trend = await trendConfirmation(id, "down");
         const marketCtx = getMarketContext(id, Math.abs(minChange), "down");
         const conf = confidenceScore(m, Math.abs(minChange), trend, marketCtx);
-        const lines = dumpWindows.map((w) => `${DUMP_ICON} ${w} دقیقه: ${changes[w].toFixed(1)}٪`).join("\n");
+        const lines = dumpWindows.map((w) => {
+          const b = bases[w];
+          return `${DUMP_ICON} ${w} دقیقه: ${changes[w].toFixed(1)}٪\n` +
+            `   $${fmtPrice(b.p)} (${fmtTimeOnly(b.t)}) ← $${fmtPrice(latestPrice)} (${nowTimeStr})`;
+        }).join("\n");
         const label = `${m.symbol.toUpperCase()} ${minChange.toFixed(1)}٪`;
         sendTelegram(
           `${DUMP_ICON} افت شدید: ${m.symbol.toUpperCase()} (${m.name})${isWatched ? " ⭐" : ""}\n${lines}\n` +
-          `قیمت فعلی: $${fmtPrice(latestPrice)}\n` +
+          `قیمت فعلی: $${fmtPrice(latestPrice)} (${nowTimeStr})\n` +
           `حجم ۲۴ ساعته: $${fmtNum(m.volume)} | رتبه: #${m.rank || "—"}\n` +
           `${conf.trendLine}\n` +
           (conf.marketLine ? `${conf.marketLine}\n` : "") +
@@ -950,6 +961,7 @@ function menuMain() {
       [{ text: "🎯 آستانه‌ها", callback_data: "menu:thresholds" }, { text: "⭐ واچ‌لیست / لیست سیاه", callback_data: "menu:lists" }],
       [{ text: "🔔 آلارم قیمت", callback_data: "menu:pricealerts" }, { text: "🔇 سکوت موقت", callback_data: "menu:mute" }],
       [{ text: "📋 گزارش و تاریخچه", callback_data: "menu:reports" }, { text: "⚙️ تنظیمات پیشرفته", callback_data: "menu:advanced" }],
+      [{ text: "📖 دستورالعمل کامل دستورات", callback_data: "guide:main" }],
     ],
   };
 }
@@ -1044,52 +1056,134 @@ function getShowContent(key) {
   return { text: "—", keyboard: null };
 }
 
+
+// ---------------- راهنمای کامل (دستورالعمل استفاده) ----------------
+function sendGuide(text, keyboard) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const body = { chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: "HTML" };
+  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => console.error("خطا در ارسال راهنما:", err.message));
+}
+function editGuide(chatId, messageId, text, keyboard) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+  const body = { chat_id: chatId, message_id: messageId, text: text, parse_mode: "HTML" };
+  if (keyboard) body.reply_markup = { inline_keyboard: keyboard };
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => console.error("خطا در ویرایش راهنما:", err.message));
+}
+
+const CMD_GUIDE = {
+  menu: { usage: "/menu", desc: "منوی دکمه‌ای همه‌ی بخش‌ها. برای کارهای روزمره (روشن/خاموش‌کردن یه تنظیم، دیدن لیست‌ها) سریع‌تر از تایپ‌کردنه.", example: null },
+  help: { usage: "/help  یا  /help نام‌دستور", desc: "همین راهنماست. بدون آرگومان، منوی دسته‌بندی‌شده نشون می‌ده. با اسم یه دستور (بدون /)، توضیح کامل همون یکی رو می‌ده.", example: "/help threshold" },
+  status: { usage: "/status", desc: "وضعیت فعلی ربات: آستانه‌ها، تعداد کوین‌های رصدشده، واچ‌لیست، لیست سیاه، آستانه‌ی پویا، هشدار حجم، و آخرین زمان بروزرسانی.", example: null },
+  pause: { usage: "/pause", desc: "رصد پامپ/دامپ/جهش‌حجم رو موقت متوقف می‌کنه. آلارم‌های قیمتی و حد ضرر/سود که دستی گذاشتی، همچنان فعال می‌مونن.", example: null },
+  resume: { usage: "/resume", desc: "رصد رو دوباره از سر می‌گیره.", example: null },
+
+  threshold: { usage: "/threshold [عدد]", desc: "آستانه‌ی رشد قیمت (به درصد) که باعث هشدار «پامپ» می‌شه. اگه کوینی توی یکی از بازه‌های ۱، ۵ یا ۱۵ دقیقه به این درصد یا بیشتر برسه، بهت خبر داده می‌شه. تغییر فوری اعمال می‌شه.", example: "/threshold 7" },
+  dumpthreshold: { usage: "/dumpthreshold [عدد]", desc: "همون آستانه‌ی بالا، ولی برای افت قیمت (دامپ). عدد رو مثبت وارد کن، خودش به‌صورت منفی ذخیره می‌شه.", example: "/dumpthreshold 6" },
+  dynamic: { usage: "/dynamic on  یا  /dynamic off", desc: "آستانه‌ی پویا: به‌جای یه آستانه‌ی ثابت برای همه، نوسان معمول هر کوین رو در نظر می‌گیره. کوین‌های پرنوسان نیاز به حرکت بزرگ‌تری دارن تا هشدار بدن؛ آستانه‌ی دستی‌ات همیشه به‌عنوان کف باقی می‌مونه.", example: null },
+  dynamicfactor: { usage: "/dynamicfactor [عدد]", desc: "ضریب آستانه‌ی پویا. هرچی بیشتر باشه، برای کوین‌های پرنوسان سخت‌گیرتر می‌شه. پیش‌فرض 0.4.", example: "/dynamicfactor 0.5" },
+  marketwide: { usage: "/marketwide [عدد]", desc: "آستانه‌ی تشخیص «هم‌جهتی با کل بازار». وقتی پامپی شناسایی می‌شه، اگه بیت‌کوین هم هم‌زمان به این اندازه حرکت کرده باشه، توی پیام هشدار داده می‌شه که این حرکت شاید فقط دنبال‌کردن بازار باشه، نه پامپ مستقل.", example: "/marketwide 3" },
+
+  volumealert: { usage: "/volumealert on  یا  /volumealert off", desc: "هشدار جهش حجم معاملات، مستقل از حرکت قیمت. وقتی حجم یه کوین ناگهان چند برابر معمولش بشه، خبر می‌ده — این می‌تونه قبل از خود پامپ اتفاق بیفته.", example: null },
+  volumefactor: { usage: "/volumefactor [عدد]", desc: "چند برابر حجم معمول کوین، به‌عنوان «جهش» حساب بشه. پیش‌فرض 2.5 (یعنی ۲.۵ برابر).", example: "/volumefactor 3" },
+
+  watch: { usage: "/watch [SYMBOL]", desc: "کوین رو به لیست ویژه اضافه می‌کنه. کوین‌های این لیست همیشه رصد می‌شن (حتی اگه حجمشون زیر حد تعیین‌شده باشه) و مقاومت/حمایتشون هم محاسبه می‌شه.", example: "/watch BTC" },
+  unwatch: { usage: "/unwatch [SYMBOL]", desc: "کوین رو از لیست ویژه حذف می‌کنه.", example: "/unwatch BTC" },
+  watchlist: { usage: "/watchlist", desc: "نمایش کامل لیست ویژه: قیمت فعلی، سطوح مقاومت/حمایت، و حد ضرر/سود فعال هر کوین.", example: null },
+  blacklist: { usage: "/blacklist [SYMBOL]", desc: "این کوین کاملاً نادیده گرفته می‌شه، هیچ نوع هشداری براش نمیاد.", example: "/blacklist DOGE" },
+  unblacklist: { usage: "/unblacklist [SYMBOL]", desc: "کوین رو از لیست سیاه حذف می‌کنه.", example: "/unblacklist DOGE" },
+  blacklistshow: { usage: "/blacklistshow", desc: "نمایش همه‌ی کوین‌های مسدودشده.", example: null },
+
+  mute: { usage: "/mute [SYMBOL] [مدت]", desc: "سکوت موقت یه کوین برای پامپ/دامپ/جهش‌حجم. واحد مدت: m برای دقیقه، h برای ساعت، d برای روز. آلارم قیمتی دستی که گذاشته باشی، همچنان فعال می‌مونه.", example: "/mute DOGE 6h" },
+  unmute: { usage: "/unmute [SYMBOL]", desc: "سکوت رو زودتر از موعد لغو می‌کنه.", example: "/unmute DOGE" },
+  mutes: { usage: "/mutes", desc: "نمایش کوین‌های ساکت‌شده و زمان پایان سکوتشون.", example: null },
+
+  levels: { usage: "/levels [SYMBOL]", desc: "سطوح مقاومت (R1-R3) و حمایت (S1-S3) فعلیِ محاسبه‌شده برای یه کوین رو نشون می‌ده، بدون نیاز به صبر برای شکسته‌شدنشون. بر پایه‌ی فرمول Pivot Point، از روی ۲۴ ساعت اخیره.", example: "/levels BTC" },
+  stoploss: { usage: "/stoploss [SYMBOL] [قیمت]", desc: "حد ضرر ثبت می‌کنه (باید پایین‌تر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🛑 می‌گیری.", example: "/stoploss BTC 60000" },
+  takeprofit: { usage: "/takeprofit [SYMBOL] [قیمت]", desc: "حد سود ثبت می‌کنه (باید بالاتر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🎯 می‌گیری.", example: "/takeprofit BTC 80000" },
+  pivot: { usage: "/pivot on  یا  /pivot off", desc: "روشن/خاموش‌کردن هشدار شکست مقاومت/حمایت برای کوین‌های لیست ویژه.", example: null },
+
+  alert: { usage: "/alert [SYMBOL] [قیمت] [قیمت دوم ...]", desc: "آلارم قیمت ثبت می‌کنه؛ می‌تونی چندتا قیمت هم‌زمان بدی. جهت (بالاتر/پایین‌تر) خودکار نسبت به قیمت فعلی تشخیص داده می‌شه؛ برای اجباری‌کردن جهت یه قیمت خاص، کلمه‌ی above یا below رو درست قبلش بذار. هر آلارم یک‌بار مصرفه.", example: "/alert BTC 70000 75000 60000" },
+  alerts: { usage: "/alerts  یا  /alerts [SYMBOL]", desc: "لیست آلارم‌های قیمت فعال رو نشون می‌ده، با دکمه‌ی ❌ زیر هرکدوم برای حذف سریع.", example: null },
+  delalert: { usage: "/delalert [SYMBOL] [قیمت]", desc: "یه آلارم خاص رو حذف می‌کنه. بدون قیمت، همه‌ی آلارم‌های اون کوین پاک می‌شن.", example: "/delalert BTC 70000" },
+
+  report: { usage: "/report [SYMBOL] [روز]", desc: "گزارش کامل یه کوین: تعداد پامپ/دامپ/آلارم قیمت، قیمت لحظه‌ی هر هشدار، و وضعیت الانش نسبت به اون‌موقع. پیش‌فرض ۳۰ روز اخیر.", example: "/report BTC 7" },
+  history: { usage: "/history", desc: "آخرین ۱۰ هشداری که ربات فرستاده، با زمانشون.", example: null },
+  backtest: { usage: "/backtest [روز]", desc: "عملکرد واقعیِ هشدارهایی که ربات توی این بازه فرستاده رو می‌سنجه: چند درصدشون تا الان هم‌جهت موندن. شبیه‌سازی کل بازار نیست، فقط آمار هشدارهای خودته.", example: "/backtest 7" },
+  export: { usage: "/export [روز]", desc: "خروجی CSV از تاریخچه‌ی هشدارها، برای تحلیل توی اکسل یا گوگل‌شیت.", example: "/export 30" },
+  dailysummary: { usage: "/dailysummary on  یا  /dailysummary off", desc: "یه پیام خلاصه هر روز (پیش‌فرض ساعت ۹ صبح ایران) با آمار ۲۴ ساعت اخیر.", example: null },
+  summaryhour: { usage: "/summaryhour [۰ تا ۲۳]", desc: "ساعت ارسال خلاصه‌ی روزانه رو تغییر می‌ده (به وقت ایران).", example: "/summaryhour 9" },
+  summarynow: { usage: "/summarynow", desc: "خلاصه‌ی روزانه رو همین الان می‌فرسته، بدون نیاز به صبر تا فردا (خوبه برای تست).", example: null },
+
+  newentrant: { usage: "/newentrant on  یا  /newentrant off", desc: "هشدار وقتی یه کوین تازه وارد لیست ۲۵۰/۵۰۰ کوین برتر بازار می‌شه — معمولاً نشونه‌ی رشد یا لیستینگ مهمه.", example: null },
+  breakout: { usage: "/breakout on  یا  /breakout off", desc: "هشدار وقتی قیمت یه کوین از سقف یا کف ۲۴ساعته‌ی قبلی‌ش رد می‌شه.", example: null },
+  breakoutfactor: { usage: "/breakoutfactor [عدد]", desc: "حداقل درصد تغییر سقف/کف تا به‌عنوان «شکست» حساب بشه. پیش‌فرض 1.", example: "/breakoutfactor 1.5" },
+};
+
+const GUIDE_SECTIONS = {
+  start: {
+    title: "🚀 شروع سریع",
+    body: "این ربات ۲۴ ساعته بازار رمزارز رو رصد می‌کنه و وقتی اتفاق مهمی بیفته (رشد ناگهانی، افت شدید، جهش حجم، شکست سطح مهم) بهت پیام می‌ده.\n\n" +
+      "برای شروع:\n" +
+      "1. /status رو بزن تا وضعیت فعلی رو ببینی\n" +
+      "2. اگه چندتا کوین خاص برات مهمه، با /watch اضافه‌شون کن\n" +
+      "3. اگه می‌خوای حد ضرر/سود بذاری، از /stoploss و /takeprofit استفاده کن\n" +
+      "4. برای مرور همه‌چی بدون تایپ، /menu رو امتحان کن\n\n" +
+      "برای توضیح کامل هر دستور، از دکمه‌های پایین برو توی هر بخش، یا بنویس «/help و اسم دستور» (مثلاً /help threshold).",
+    cmds: [],
+  },
+  control: { title: "⚙️ کنترل و وضعیت", cmds: ["menu", "help", "status", "pause", "resume"] },
+  thresholds: { title: "🎯 آستانه‌ها", cmds: ["threshold", "dumpthreshold", "dynamic", "dynamicfactor", "marketwide"] },
+  volume: { title: "📢 حجم معاملات", cmds: ["volumealert", "volumefactor"] },
+  lists: { title: "⭐ واچ‌لیست و لیست سیاه", cmds: ["watch", "unwatch", "watchlist", "blacklist", "unblacklist", "blacklistshow"] },
+  mute: { title: "🔇 سکوت موقت", cmds: ["mute", "unmute", "mutes"] },
+  vip: { title: "📊 لیست ویژه (مقاومت/حمایت/حد ضرر/سود)", cmds: ["levels", "stoploss", "takeprofit", "pivot"] },
+  pricealerts: { title: "🔔 آلارم قیمت", cmds: ["alert", "alerts", "delalert"] },
+  reports: { title: "📋 گزارش و تاریخچه", cmds: ["report", "history", "backtest", "export", "dailysummary", "summaryhour", "summarynow"] },
+  advanced: { title: "🧪 هشدارهای پیشرفته", cmds: ["newentrant", "breakout", "breakoutfactor"] },
+};
+
+function formatCmdGuide(name) {
+  const g = CMD_GUIDE[name];
+  if (!g) return "";
+  let block = `<b>${g.usage}</b>\n${g.desc}`;
+  if (g.example) block += `\nمثال: <code>${g.example}</code>`;
+  return block;
+}
+function guideSectionView(key) {
+  const sec = GUIDE_SECTIONS[key];
+  if (!sec) return guideMainView();
+  let text = `<b>${sec.title}</b>\n\n`;
+  if (sec.body) text += sec.body;
+  else text += sec.cmds.map(formatCmdGuide).join("\n\n");
+  const keyboard = [[{ text: "🔙 فهرست راهنما", callback_data: "guide:main" }]];
+  return { text, keyboard };
+}
+function guideMainView() {
+  return {
+    text: "📖 <b>دستورالعمل کامل پامپ‌یاب</b>\nیه بخش رو انتخاب کن تا توضیح کامل دستوراتش رو ببینی:",
+    keyboard: [
+      [{ text: "🚀 شروع سریع", callback_data: "guide:start" }],
+      [{ text: "⚙️ کنترل و وضعیت", callback_data: "guide:control" }, { text: "🎯 آستانه‌ها", callback_data: "guide:thresholds" }],
+      [{ text: "📢 حجم معاملات", callback_data: "guide:volume" }, { text: "⭐ واچ‌لیست/بلاک‌لیست", callback_data: "guide:lists" }],
+      [{ text: "🔇 سکوت موقت", callback_data: "guide:mute" }, { text: "📊 لیست ویژه", callback_data: "guide:vip" }],
+      [{ text: "🔔 آلارم قیمت", callback_data: "guide:pricealerts" }, { text: "📋 گزارش‌ها", callback_data: "guide:reports" }],
+      [{ text: "🧪 هشدارهای پیشرفته", callback_data: "guide:advanced" }],
+    ],
+  };
+}
+
 // ---------------- دستورات و دکمه‌های تلگرام ----------------
 let telegramOffset = 0;
 
-function helpText() {
-  return "دستورات قابل استفاده:\n" +
-    "/menu — منوی دکمه‌ای همه‌ی بخش‌ها (پیشنهاد می‌شه از همین شروع کنی)\n" +
-    "/status — وضعیت فعلی\n" +
-    "/threshold <عدد> — تغییر آستانه‌ی پامپ (٪)\n" +
-    "/dumpthreshold <عدد> — تغییر آستانه‌ی افت (٪)\n" +
-    "/pause — توقف موقت رصد پامپ/دامپ (آلارم‌های قیمت فعال می‌مونن)\n" +
-    "/resume — از سرگیری رصد\n" +
-    "/watch <SYMBOL> — اضافه‌کردن به واچ‌لیست\n" +
-    "/unwatch <SYMBOL> — حذف از واچ‌لیست\n" +
-    "/watchlist — نمایش واچ‌لیست\n" +
-    "/blacklist <SYMBOL> — نادیده‌گرفتن یه کوین\n" +
-    "/unblacklist <SYMBOL> — حذف از لیست سیاه\n" +
-    "/blacklistshow — نمایش لیست سیاه\n" +
-    "/history — آخرین هشدارها\n" +
-    "/backtest <روز> — عملکرد واقعی هشدارهای گذشته (پیش‌فرض ۷ روز)\n" +
-    "/alert <SYMBOL> <قیمت> [قیمت دوم ...] — ثبت آلارم قیمت (چندتا هم‌زمان)\n" +
-    "/alerts [SYMBOL] — لیست آلارم‌های قیمت (با دکمه‌ی حذف)\n" +
-    "/delalert <SYMBOL> [قیمت] — حذف آلارم (بدون قیمت = همه‌ی آلارم‌های اون کوین)\n" +
-    "/report <SYMBOL> [روز] — گزارش هشدارهای یک کوین (پیش‌فرض ۳۰ روز)\n" +
-    "/dynamic on|off — فعال/غیرفعال‌کردن آستانه‌ی پویا (بر اساس نوسان معمول هر کوین)\n" +
-    "/dynamicfactor <عدد> — ضریب آستانه‌ی پویا (پیش‌فرض 0.4)\n" +
-    "/volumealert on|off — فعال/غیرفعال‌کردن هشدار جهش حجم معاملات\n" +
-    "/volumefactor <عدد> — چند برابر حجم معمول، جهش حساب بشه (پیش‌فرض 2.5)\n" +
-    "/mute <SYMBOL> <مدت> — سکوت موقت یه کوین، مثلاً /mute DOGE 6h یا /mute DOGE 30m\n" +
-    "/unmute <SYMBOL> — لغو سکوت\n" +
-    "/mutes — نمایش کوین‌های ساکت‌شده\n" +
-    "/export [روز] — خروجی CSV از تاریخچه (پیش‌فرض ۳۰ روز)\n" +
-    "/dailysummary on|off — فعال/غیرفعال‌کردن خلاصه‌ی روزانه\n" +
-    "/summaryhour <۰ تا ۲۳> — ساعت ارسال خلاصه‌ی روزانه (به وقت ایران)\n" +
-    "/summarynow — ارسال فوری خلاصه (برای تست)\n" +
-    "/marketwide <عدد> — آستانه‌ی «حرکت کل بازار» برای تشخیص هم‌جهتی با بیت‌کوین (پیش‌فرض 2.5)\n" +
-    "/newentrant on|off — روشن/خاموش‌کردن هشدار ورود به لیست برتر\n" +
-    "/breakout on|off — روشن/خاموش‌کردن هشدار شکست سقف/کف ۲۴ ساعته\n" +
-    "/breakoutfactor <عدد> — حداقل درصد تغییر برای حساب‌شدن به‌عنوان شکست (پیش‌فرض 1)\n" +
-    "\n⭐ لیست ویژه (واچ‌لیست):\n" +
-    "/watch <SYMBOL> — افزودن به لیست ویژه\n" +
-    "/levels <SYMBOL> — نمایش مقاومت/حمایت محاسبه‌شده\n" +
-    "/stoploss <SYMBOL> <قیمت> — ثبت حد ضرر (خودکار به لیست ویژه اضافه می‌شه)\n" +
-    "/takeprofit <SYMBOL> <قیمت> — ثبت حد سود (خودکار به لیست ویژه اضافه می‌شه)\n" +
-    "/pivot on|off — روشن/خاموش‌کردن هشدار شکست مقاومت/حمایت\n" +
-    "/help — همین راهنما";
-}
 function statusText() {
   return "📊 وضعیت پامپ‌یاب\n" +
     `حالت: ${state.paused ? "متوقف ⏸" : "فعال ▶️"}\n` +
@@ -1135,7 +1229,18 @@ async function handleCommand(text) {
   }
   if (cmd === "/menu") { const v = menuMain(); sendTelegram(v.text, v.keyboard); return; }
   if (cmd === "/status") { sendTelegram(statusText()); return; }
-  if (cmd === "/help" || cmd === "/start") { sendTelegram(helpText()); return; }
+  if (cmd === "/help" || cmd === "/start") {
+    const arg = (parts[1] || "").replace(/^\//, "").toLowerCase();
+    if (arg && CMD_GUIDE[arg]) {
+      sendGuide(formatCmdGuide(arg), [[{ text: "🔙 فهرست راهنما", callback_data: "guide:main" }]]);
+    } else if (arg) {
+      sendTelegram(`دستوری به اسم «${arg}» پیدا نشد. برای فهرست کامل، فقط /help رو بفرست.`);
+    } else {
+      const v = guideMainView();
+      sendGuide(v.text, v.keyboard);
+    }
+    return;
+  }
   if (cmd === "/history") { sendTelegram(historyText()); return; }
   if (cmd === "/backtest") {
     const days = parseFloat(parts[1]) || 7;
@@ -1366,6 +1471,13 @@ async function handleCallback(cq) {
     const v = getMenuSection(section);
     answerCallback(cq.id, "");
     editMessage(chatId, msgId, v.text, v.keyboard);
+    return;
+  }
+  if (data.startsWith("guide:")) {
+    const section = data.slice("guide:".length);
+    const v = section === "main" ? guideMainView() : guideSectionView(section);
+    answerCallback(cq.id, "");
+    editGuide(chatId, msgId, v.text, v.keyboard);
     return;
   }
   if (data.startsWith("show:")) {
