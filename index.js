@@ -29,6 +29,7 @@ const DAILY_SUMMARY_HOUR_DEFAULT = parseInt(process.env.DAILY_SUMMARY_HOUR || "9
 const MARKET_WIDE_THRESHOLD_DEFAULT = parseFloat(process.env.MARKET_WIDE_THRESHOLD || "2.5");
 const BREAKOUT_MIN_PERCENT_DEFAULT = parseFloat(process.env.BREAKOUT_MIN_PERCENT || "1");
 const PIVOT_REFRESH_HOURS = parseFloat(process.env.PIVOT_REFRESH_HOURS || "4");
+const PIVOT_HYSTERESIS_DEFAULT = parseFloat(process.env.PIVOT_HYSTERESIS_PERCENT || "0.5");
 const BTC_ID = "bitcoin";
 const ENV_BLACKLIST = (process.env.BLACKLIST_IDS || "").split(",").map((s)=>s.trim()).filter(Boolean);
 
@@ -62,6 +63,7 @@ let state = {
   breakoutAlertEnabled: true,
   breakoutMinPercent: BREAKOUT_MIN_PERCENT_DEFAULT,
   pivotAlertEnabled: true,
+  pivotHysteresisPercent: PIVOT_HYSTERESIS_DEFAULT,
 };
 function loadState() {
   try {
@@ -386,24 +388,44 @@ async function checkPivotCrossings(id, price, symbol, name) {
   const prevState = pivotCrossState.get(id);
   const newState = {};
   for (const key of ["R1", "R2", "R3", "S1", "S2", "S3"]) {
-    const side = price >= levels[key] ? "above" : "below";
-    newState[key] = side;
-    if (prevState) {
-      const isResistance = key[0] === "R";
-      if (isResistance && prevState[key] === "below" && side === "above") {
+    const level = levels[key];
+    const band = level * (state.pivotHysteresisPercent / 100);
+    const isResistance = key[0] === "R";
+
+    if (!prevState) {
+      // اولین باری که این کوین رو می‌بینیم: فقط baseline ثبت می‌شه، هشدار داده نمی‌شه
+      newState[key] = price >= level ? "above" : "below";
+      continue;
+    }
+
+    const prevSide = prevState[key];
+    if (isResistance) {
+      if (prevSide !== "above" && price >= level) {
+        newState[key] = "above";
         sendTelegram(
           `${PUMP_ICON1} شکست ${PIVOT_LABELS[key]}: ${symbol.toUpperCase()} (${name}) ⭐\n` +
-          `قیمت از سطح $${fmtPrice(levels[key])} عبور کرد\nقیمت فعلی: $${fmtPrice(price)}`,
+          `قیمت از سطح $${fmtPrice(level)} عبور کرد\nقیمت فعلی: $${fmtPrice(price)}`,
           [[{ text: "📈 نمودار", url: chartLink(id) }]]
         );
         pushHistoryLog("سطح", symbol.toUpperCase(), name, `${symbol.toUpperCase()} شکست ${PIVOT_LABELS[key]}`, id, price, null);
-      } else if (!isResistance && prevState[key] === "above" && side === "below") {
+      } else if (prevSide === "above" && price < level - band) {
+        newState[key] = "below"; // فقط آماده‌سازی دوباره، بدون هشدار
+      } else {
+        newState[key] = prevSide;
+      }
+    } else {
+      if (prevSide !== "below" && price < level) {
+        newState[key] = "below";
         sendTelegram(
           `${DUMP_ICON1} شکست ${PIVOT_LABELS[key]}: ${symbol.toUpperCase()} (${name}) ⭐\n` +
-          `قیمت زیر سطح $${fmtPrice(levels[key])} رفت\nقیمت فعلی: $${fmtPrice(price)}`,
+          `قیمت زیر سطح $${fmtPrice(level)} رفت\nقیمت فعلی: $${fmtPrice(price)}`,
           [[{ text: "📈 نمودار", url: chartLink(id) }]]
         );
         pushHistoryLog("سطح", symbol.toUpperCase(), name, `${symbol.toUpperCase()} شکست ${PIVOT_LABELS[key]}`, id, price, null);
+      } else if (prevSide === "below" && price > level + band) {
+        newState[key] = "above"; // فقط آماده‌سازی دوباره، بدون هشدار
+      } else {
+        newState[key] = prevSide;
       }
     }
   }
@@ -570,7 +592,7 @@ async function pollOnce() {
         const coins = await fetchMarketsPage(p);
         for (const c of coins) {
           if (!c.current_price) continue;
-          meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
+          meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
           pushPrice(c.id, c.current_price, now);
           updateBaselines(c, now);
           checkBreakout(c, now, state.watchlist.some((w) => w.id === c.id));
@@ -590,7 +612,7 @@ async function pollOnce() {
       const extra = await fetchMarketsByIds(missing);
       for (const c of extra) {
         if (!c.current_price) continue;
-        meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0 });
+        meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
         pushPrice(c.id, c.current_price, now);
         updateBaselines(c, now);
         checkBreakout(c, now, true); // این حلقه فقط برای واچ‌لیست/کوین‌های گم‌شده‌ست
@@ -750,6 +772,113 @@ function ensureWatched(found) {
   }
   return false;
 }
+// ---------------- مشخصات کامل یه رمزارز (/profile) ----------------
+async function fetchCoinFullStats(id) {
+  const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${id}&price_change_percentage=1h,24h,7d`;
+  const headers = {};
+  if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error("coingecko_failed_" + res.status);
+  const data = await res.json();
+  return data[0] || null;
+}
+function candleTrendLabel(candles, n) {
+  const last = (candles || []).slice(-n);
+  if (last.length < 2) return "نامشخص";
+  const startPrice = last[0][1]; // قیمت باز شدن اولین کندل
+  const endPrice = last[last.length - 1][4]; // قیمت بسته شدن آخرین کندل
+  if (!startPrice) return "نامشخص";
+  const pct = ((endPrice - startPrice) / startPrice) * 100;
+  if (pct > 1) return `صعودی 📈 (+${pct.toFixed(1)}٪)`;
+  if (pct < -1) return `نزولی 📉 (${pct.toFixed(1)}٪)`;
+  return `خنثی ↔️ (${pct >= 0 ? "+" : ""}${pct.toFixed(1)}٪)`;
+}
+function pctLabel(v) {
+  if (v == null || isNaN(v)) return "نامشخص";
+  const sign = v >= 0 ? "+" : "";
+  return `${sign}${v.toFixed(1)}٪`;
+}
+async function cmdProfile(parts) {
+  if (!parts[1]) { sendTelegram("مثال: /profile BTC"); return; }
+  const found = await resolveSymbolToId(parts[1]);
+  if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
+  sendTelegram("در حال آماده‌سازی مشخصات...");
+
+  let stats = null, candles = null, levels = null;
+  try { stats = await fetchCoinFullStats(found.id); } catch (e) { /* ignore */ }
+  try { candles = await fetchOHLC4h(found.id); } catch (e) { /* ignore */ }
+  try { levels = await ensurePivotLevels(found.id); } catch (e) { /* ignore */ }
+
+  if (!stats) { sendTelegram("نتونستم اطلاعات این کوین رو بگیرم؛ دوباره امتحان کن."); return; }
+
+  const price = stats.current_price;
+  const high24 = stats.high_24h, low24 = stats.low_24h;
+  const chg1h = stats.price_change_percentage_1h_in_currency;
+  const chg24h = stats.price_change_percentage_24h_in_currency != null ? stats.price_change_percentage_24h_in_currency : stats.price_change_percentage_24h;
+  const chg7d = stats.price_change_percentage_7d_in_currency;
+  const trend4h = candles ? candleTrendLabel(candles, 2) : "نامشخص";
+
+  let text = `📋 مشخصات ${found.symbol.toUpperCase()} (${stats.name})\n\n`;
+  text += `💰 قیمت فعلی: $${fmtPrice(price)}\n`;
+  text += `رتبه‌ی بازار: #${stats.market_cap_rank || "—"}\n\n`;
+
+  text += `📊 روندها:\n`;
+  text += `  ۱ ساعت: ${pctLabel(chg1h)}\n`;
+  text += `  ۴ ساعت (بر پایه کندل): ${trend4h}\n`;
+  text += `  روزانه (۲۴ ساعت): ${pctLabel(chg24h)}\n`;
+  text += `  هفتگی (۷ روز): ${pctLabel(chg7d)}\n\n`;
+
+  if (high24 != null && low24 != null) {
+    const distHigh = ((high24 - price) / high24) * 100;
+    const distLow = ((price - low24) / low24) * 100;
+    text += `↕️ بازه‌ی ۲۴ ساعته: سقف $${fmtPrice(high24)} | کف $${fmtPrice(low24)}\n`;
+    text += `   (${distHigh.toFixed(1)}٪ پایین‌تر از سقف | ${distLow.toFixed(1)}٪ بالاتر از کف)\n\n`;
+  }
+
+  if (levels) {
+    text += `🎯 مقاومت‌ها: R1 $${fmtPrice(levels.R1)} · R2 $${fmtPrice(levels.R2)} · R3 $${fmtPrice(levels.R3)}\n`;
+    text += `🛡 حمایت‌ها: S1 $${fmtPrice(levels.S1)} · S2 $${fmtPrice(levels.S2)} · S3 $${fmtPrice(levels.S3)}\n\n`;
+  } else {
+    text += `🎯 مقاومت/حمایت: نتونستم محاسبه کنم\n\n`;
+  }
+
+  const sl = state.priceAlerts.find((a) => a.coinId === found.id && a.kind === "stoploss");
+  const tp = state.priceAlerts.find((a) => a.coinId === found.id && a.kind === "takeprofit");
+  if (sl || tp) {
+    if (sl) text += `🛑 حد ضرر فعال: $${fmtPrice(sl.target)}\n`;
+    if (tp) text += `🎯 حد سود فعال: $${fmtPrice(tp.target)}\n`;
+    text += "\n";
+  }
+
+  text += `💧 حجم ۲۴ ساعته: $${fmtNum(stats.total_volume)}\n`;
+  if (stats.market_cap) {
+    const turnover = (stats.total_volume / stats.market_cap) * 100;
+    text += `   نسبت حجم به ارزش‌بازار: ${turnover.toFixed(1)}٪\n`;
+  }
+  text += "\n";
+
+  const btcMeta = meta.get(BTC_ID);
+  if (found.id !== BTC_ID && btcMeta && btcMeta.change24h != null && chg24h != null) {
+    const diff = chg24h - btcMeta.change24h;
+    let rel;
+    if (diff > 2) rel = `قوی‌تر از بیت‌کوین (+${diff.toFixed(1)}٪ نسبت به BTC) ✅`;
+    else if (diff < -2) rel = `ضعیف‌تر از بیت‌کوین (${diff.toFixed(1)}٪ نسبت به BTC) ⚠️`;
+    else rel = "تقریباً هم‌تراز با بیت‌کوین";
+    text += `🌐 وضعیت نسبت به بازار: ${rel}\n\n`;
+  }
+
+  const isWatched = state.watchlist.some((w) => w.id === found.id);
+  const isBlacklisted = state.blacklist.includes(found.id);
+  const muteEntry = state.mutes.find((mm) => mm.id === found.id && mm.until > Date.now());
+  let statusLine = isWatched ? "⭐ توی لیست ویژه" : "توی لیست ویژه نیست";
+  if (isBlacklisted) statusLine += " | 🚫 مسدود";
+  if (muteEntry) statusLine += ` | 🔇 ساکت تا ${fmtDateTime(muteEntry.until)}`;
+  text += `وضعیت در ربات: ${statusLine}\n\n`;
+  text += `این فقط خلاصه‌ی داده‌هاست، نه توصیه‌ی خرید یا فروش.`;
+
+  sendTelegram(text, [[{ text: "📈 نمودار", url: chartLink(found.id) }]]);
+}
+
 async function cmdStopOrTake(parts, kind) {
   const label = kind === "stoploss" ? "حد ضرر" : "حد سود";
   const usage = kind === "stoploss"
@@ -1110,6 +1239,8 @@ const CMD_GUIDE = {
   stoploss: { usage: "/stoploss [SYMBOL] [قیمت]", desc: "حد ضرر ثبت می‌کنه (باید پایین‌تر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🛑 می‌گیری.", example: "/stoploss BTC 60000" },
   takeprofit: { usage: "/takeprofit [SYMBOL] [قیمت]", desc: "حد سود ثبت می‌کنه (باید بالاتر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🎯 می‌گیری.", example: "/takeprofit BTC 80000" },
   pivot: { usage: "/pivot on  یا  /pivot off", desc: "روشن/خاموش‌کردن هشدار شکست مقاومت/حمایت برای کوین‌های لیست ویژه.", example: null },
+  pivotbuffer: { usage: "/pivotbuffer [عدد]", desc: "یه منطقه‌ی امن دور هر سطح مقاومت/حمایت (به درصد) تا وقتی قیمت دقیقاً روی مرز نوسان می‌کنه، هشدار تکراری نیاد. پیش‌فرض 0.5٪.", example: "/pivotbuffer 0.5" },
+  profile: { usage: "/profile [SYMBOL]", desc: "مشخصات کامل یه رمزارز: قیمت، روند ۱ساعته/۴ساعته/روزانه/هفتگی، سقف و کف ۲۴ساعته، مقاومت و حمایت، حد ضرر/سود فعال، حجم معاملات، و وضعیت نسبت به بیت‌کوین. همه‌چی یک‌جا.", example: "/profile BTC" },
 
   alert: { usage: "/alert [SYMBOL] [قیمت] [قیمت دوم ...]", desc: "آلارم قیمت ثبت می‌کنه؛ می‌تونی چندتا قیمت هم‌زمان بدی. جهت (بالاتر/پایین‌تر) خودکار نسبت به قیمت فعلی تشخیص داده می‌شه؛ برای اجباری‌کردن جهت یه قیمت خاص، کلمه‌ی above یا below رو درست قبلش بذار. هر آلارم یک‌بار مصرفه.", example: "/alert BTC 70000 75000 60000" },
   alerts: { usage: "/alerts  یا  /alerts [SYMBOL]", desc: "لیست آلارم‌های قیمت فعال رو نشون می‌ده، با دکمه‌ی ❌ زیر هرکدوم برای حذف سریع.", example: null },
@@ -1145,7 +1276,7 @@ const GUIDE_SECTIONS = {
   volume: { title: "📢 حجم معاملات", cmds: ["volumealert", "volumefactor"] },
   lists: { title: "⭐ واچ‌لیست و لیست سیاه", cmds: ["watch", "unwatch", "watchlist", "blacklist", "unblacklist", "blacklistshow"] },
   mute: { title: "🔇 سکوت موقت", cmds: ["mute", "unmute", "mutes"] },
-  vip: { title: "📊 لیست ویژه (مقاومت/حمایت/حد ضرر/سود)", cmds: ["levels", "stoploss", "takeprofit", "pivot"] },
+  vip: { title: "📊 لیست ویژه (مقاومت/حمایت/حد ضرر/سود)", cmds: ["levels", "stoploss", "takeprofit", "pivot", "pivotbuffer", "profile"] },
   pricealerts: { title: "🔔 آلارم قیمت", cmds: ["alert", "alerts", "delalert"] },
   reports: { title: "📋 گزارش و تاریخچه", cmds: ["report", "history", "backtest", "export", "dailysummary", "summaryhour", "summarynow"] },
   advanced: { title: "🧪 هشدارهای پیشرفته", cmds: ["newentrant", "breakout", "breakoutfactor"] },
@@ -1316,8 +1447,15 @@ async function handleCommand(text) {
     );
     return;
   }
+  if (cmd === "/profile") { await cmdProfile(parts); return; }
   if (cmd === "/stoploss") { await cmdStopOrTake(parts, "stoploss"); return; }
   if (cmd === "/takeprofit") { await cmdStopOrTake(parts, "takeprofit"); return; }
+  if (cmd === "/pivotbuffer") {
+    const v = parseFloat(parts[1]);
+    if (!isNaN(v) && v > 0) { state.pivotHysteresisPercent = v; saveState(); sendTelegram(`✅ منطقه‌ی امن مقاومت/حمایت روی ${v}٪ تنظیم شد.`); }
+    else sendTelegram("عدد نامعتبر. مثال: /pivotbuffer 0.5");
+    return;
+  }
   if (cmd === "/pivot") {
     if (parts[1] === "on") { state.pivotAlertEnabled = true; saveState(); sendTelegram("✅ هشدار شکست مقاومت/حمایت فعال شد."); }
     else if (parts[1] === "off") { state.pivotAlertEnabled = false; saveState(); sendTelegram("⏹ هشدار شکست مقاومت/حمایت غیرفعال شد."); }
@@ -1573,6 +1711,8 @@ const BOT_COMMANDS = [
   { command: "stoploss", description: "ثبت حد ضرر" },
   { command: "takeprofit", description: "ثبت حد سود" },
   { command: "pivot", description: "روشن/خاموش شکست مقاومت/حمایت" },
+  { command: "pivotbuffer", description: "منطقه‌ی امن دور سطوح مقاومت/حمایت" },
+  { command: "profile", description: "مشخصات کامل یه رمزارز" },
 ];
 async function registerBotUI() {
   try {
