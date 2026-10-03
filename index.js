@@ -99,6 +99,16 @@ let downAlertSent = false;
 
 // ---------------- ابزارهای کمکی ----------------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+// برای درخواست‌های تکی و کم‌تکرار (مثل /alert و /profile)، یه بار دیگه هم امتحان کن اگه فقط به‌خاطر محدودیت نرخ شکست خورد
+async function withRetry(fn, retries = 1, delayMs = 3000) {
+  for (let i = 0; i <= retries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i === retries || e.message !== "rate_limited_429") throw e;
+      await sleep(delayMs);
+    }
+  }
+}
 function fmtNum(n) {
   if (n == null || isNaN(n)) return "—";
   if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";
@@ -246,6 +256,7 @@ async function searchCoinBySymbol(symbol) {
   const headers = {};
   if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
   const res = await fetch(url, { headers });
+  if (res.status === 429) throw new Error("rate_limited_429");
   if (!res.ok) return null;
   const data = await res.json();
   if (!data.coins || !data.coins.length) return null;
@@ -374,7 +385,7 @@ async function ensurePivotLevels(id) {
   const now = Date.now();
   if (cached && now - cached.computedAt < PIVOT_REFRESH_HOURS * 3600000) return cached.levels;
   try {
-    const candles = await fetchOHLC4h(id);
+    const candles = await withRetry(() => fetchOHLC4h(id));
     const levels = computePivots(candles);
     if (levels) { pivotLevels.set(id, { levels, computedAt: now }); return levels; }
   } catch (e) { /* از مقدار قبلی (اگه بود) استفاده می‌شه */ }
@@ -716,7 +727,7 @@ async function cmdAlert(parts) {
   if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
   let current = null;
   try {
-    const data = await fetchMarketsByIds([found.id]);
+    const data = await withRetry(() => fetchMarketsByIds([found.id]));
     current = data[0] && data[0].current_price;
   } catch (e) { /* ignore */ }
   if (current == null) { sendTelegram("نتونستم قیمت فعلی رو بگیرم؛ چند لحظه‌ی دیگه دوباره امتحان کن."); return; }
@@ -805,7 +816,7 @@ async function cmdProfile(parts) {
   sendTelegram("در حال آماده‌سازی مشخصات...");
 
   let stats = null, candles = null, levels = null;
-  try { stats = await fetchCoinFullStats(found.id); } catch (e) { /* ignore */ }
+  try { stats = await withRetry(() => fetchCoinFullStats(found.id)); } catch (e) { /* ignore */ }
   try { candles = await fetchOHLC4h(found.id); } catch (e) { /* ignore */ }
   try { levels = await ensurePivotLevels(found.id); } catch (e) { /* ignore */ }
 
@@ -893,7 +904,7 @@ async function cmdStopOrTake(parts, kind) {
   if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
   let current = null;
   try {
-    const data = await fetchMarketsByIds([found.id]);
+    const data = await withRetry(() => fetchMarketsByIds([found.id]));
     current = data[0] && data[0].current_price;
   } catch (e) { /* ignore */ }
   if (current == null) { sendTelegram("نتونستم قیمت فعلی رو بگیرم؛ چند لحظه‌ی دیگه دوباره امتحان کن."); return; }
@@ -1088,8 +1099,9 @@ function menuMain() {
     keyboard: [
       [{ text: (state.paused ? "▶️ ادامه‌ی رصد" : "⏸ توقف رصد"), callback_data: "toggle:paused:main" }, { text: "📊 وضعیت کامل", callback_data: "show:status" }],
       [{ text: "🎯 آستانه‌ها", callback_data: "menu:thresholds" }, { text: "⭐ واچ‌لیست / لیست سیاه", callback_data: "menu:lists" }],
-      [{ text: "🔔 آلارم قیمت", callback_data: "menu:pricealerts" }, { text: "🔇 سکوت موقت", callback_data: "menu:mute" }],
-      [{ text: "📋 گزارش و تاریخچه", callback_data: "menu:reports" }, { text: "⚙️ تنظیمات پیشرفته", callback_data: "menu:advanced" }],
+      [{ text: "📊 لیست ویژه", callback_data: "menu:vip" }, { text: "🔔 آلارم قیمت", callback_data: "menu:pricealerts" }],
+      [{ text: "🔇 سکوت موقت", callback_data: "menu:mute" }, { text: "📋 گزارش و تاریخچه", callback_data: "menu:reports" }],
+      [{ text: "⚙️ تنظیمات پیشرفته", callback_data: "menu:advanced" }],
       [{ text: "📖 دستورالعمل کامل دستورات", callback_data: "guide:main" }],
     ],
   };
@@ -1104,14 +1116,29 @@ function menuThresholds() {
 }
 function menuLists() {
   return {
-    text: "⭐ لیست ویژه / لیست سیاه\n\n" +
-      "برای افزودن به لیست ویژه، تایپ کن:\n/watch BTC — رصد کامل (پامپ/دامپ/حجم/شکست/مقاومت‌وحمایت)\n" +
-      "/stoploss BTC 60000 — حد ضرر (خودکار اضافه می‌شه)\n" +
-      "/takeprofit BTC 80000 — حد سود (خودکار اضافه می‌شه)\n" +
-      "/levels BTC — نمایش مقاومت/حمایت\n\n" +
-      "برای مسدودکردن کامل: /blacklist DOGE",
+    text: "⭐ واچ‌لیست / لیست سیاه\n\n" +
+      "برای افزودن کوین به واچ‌لیست (رصد کامل، حتی اگه حجمش کمه)، تایپ کن:\n/watch BTC\nحذف: /unwatch BTC\n\n" +
+      "برای مسدودکردن کامل یه کوین: /blacklist DOGE\nحذف: /unblacklist DOGE\n\n" +
+      "برای ابزارهای تحلیلی لیست ویژه (مقاومت/حمایت، حد ضرر/سود، مشخصات کامل)، برو به بخش «📊 لیست ویژه» توی منوی اصلی.",
     keyboard: [
-      [{ text: "⭐ نمایش لیست ویژه", callback_data: "show:watchlist" }, { text: "🚫 نمایش لیست سیاه", callback_data: "show:blacklistshow" }],
+      [{ text: "⭐ نمایش واچ‌لیست", callback_data: "show:watchlist" }, { text: "🚫 نمایش لیست سیاه", callback_data: "show:blacklistshow" }],
+      [{ text: "🔙 منو", callback_data: "menu:main" }],
+    ],
+  };
+}
+function menuVip() {
+  return {
+    text: "📊 لیست ویژه\n\n" +
+      `مقاومت/حمایت: ${state.pivotAlertEnabled ? "فعال ✅ (منطقه‌ی امن " + state.pivotHysteresisPercent + "٪)" : "غیرفعال ⏹"}\n\n` +
+      "دستورات:\n" +
+      "/profile BTC — مشخصات کامل (قیمت، روندها، سقف/کف، مقاومت/حمایت، حجم، وضعیت نسبت به بازار)\n" +
+      "/levels BTC — فقط مقاومت/حمایت فعلی\n" +
+      "/stoploss BTC 60000 — ثبت حد ضرر (خودکار به واچ‌لیست هم اضافه می‌شه)\n" +
+      "/takeprofit BTC 80000 — ثبت حد سود (خودکار به واچ‌لیست هم اضافه می‌شه)\n" +
+      "/pivotbuffer 0.5 — تنظیم منطقه‌ی امن دور هر سطح",
+    keyboard: [
+      [{ text: "⭐ نمایش واچ‌لیست کامل", callback_data: "show:watchlist" }],
+      [{ text: state.pivotAlertEnabled ? "⏹ خاموش‌کردن مقاومت/حمایت" : "✅ روشن‌کردن مقاومت/حمایت", callback_data: "toggle:pivotAlertEnabled:vip" }],
       [{ text: "🔙 منو", callback_data: "menu:main" }],
     ],
   };
@@ -1153,15 +1180,14 @@ function menuAdvanced() {
       `هشدار جهش حجم: ${state.volumeAlertEnabled ? "فعال ✅" : "غیرفعال ⏹"} (×${state.volumeSpikeMultiplier})\n` +
       `خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "فعال ✅ (ساعت " + state.dailySummaryHour + ")" : "غیرفعال ⏹"}\n` +
       `ورود تازه به لیست برتر: ${state.newEntrantEnabled ? "فعال ✅" : "غیرفعال ⏹"}\n` +
-      `شکست سقف/کف ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال ✅ (" + state.breakoutMinPercent + "٪)" : "غیرفعال ⏹"}\n` +
-      `مقاومت/حمایت لیست ویژه: ${state.pivotAlertEnabled ? "فعال ✅" : "غیرفعال ⏹"}`,
+      `شکست سقف/کف ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال ✅ (" + state.breakoutMinPercent + "٪)" : "غیرفعال ⏹"}\n\n` +
+      "(مقاومت/حمایت لیست ویژه رو از بخش «📊 لیست ویژه» کنترل کن)",
     keyboard: [
       [{ text: state.dynamicEnabled ? "⏹ خاموش‌کردن آستانه‌ی پویا" : "✅ روشن‌کردن آستانه‌ی پویا", callback_data: "toggle:dynamicEnabled:advanced" }],
       [{ text: state.volumeAlertEnabled ? "⏹ خاموش‌کردن هشدار حجم" : "✅ روشن‌کردن هشدار حجم", callback_data: "toggle:volumeAlertEnabled:advanced" }],
       [{ text: state.dailySummaryEnabled ? "⏹ خاموش‌کردن خلاصه‌ی روزانه" : "✅ روشن‌کردن خلاصه‌ی روزانه", callback_data: "toggle:dailySummaryEnabled:advanced" }],
       [{ text: state.newEntrantEnabled ? "⏹ خاموش‌کردن ورود تازه" : "✅ روشن‌کردن ورود تازه", callback_data: "toggle:newEntrantEnabled:advanced" }],
       [{ text: state.breakoutAlertEnabled ? "⏹ خاموش‌کردن شکست سقف/کف" : "✅ روشن‌کردن شکست سقف/کف", callback_data: "toggle:breakoutAlertEnabled:advanced" }],
-      [{ text: state.pivotAlertEnabled ? "⏹ خاموش‌کردن مقاومت/حمایت" : "✅ روشن‌کردن مقاومت/حمایت", callback_data: "toggle:pivotAlertEnabled:advanced" }],
       [{ text: "🔙 منو", callback_data: "menu:main" }],
     ],
   };
@@ -1169,6 +1195,7 @@ function menuAdvanced() {
 function getMenuSection(section) {
   if (section === "thresholds") return menuThresholds();
   if (section === "lists") return menuLists();
+  if (section === "vip") return menuVip();
   if (section === "pricealerts") return menuPriceAlerts();
   if (section === "mute") return menuMute();
   if (section === "reports") return menuReports();
@@ -1340,7 +1367,9 @@ async function resolveSymbolToId(symbolRaw) {
   for (const [id, m] of meta.entries()) {
     if (m.symbol.toUpperCase() === symbol) return { id, symbol: m.symbol, name: m.name };
   }
-  const found = await searchCoinBySymbol(symbolRaw);
+  let found = null;
+  try { found = await withRetry(() => searchCoinBySymbol(symbolRaw)); }
+  catch (e) { found = null; } // بعد از یه بار تلاش دوباره هم جواب نداد؛ مثل «پیدا نشد» رفتار می‌کنیم
   if (found) return { id: found.id, symbol: found.symbol, name: found.name };
   return null;
 }
