@@ -26,6 +26,7 @@ const TIMEZONE = process.env.TIMEZONE || "Asia/Tehran";
 const DYNAMIC_THRESHOLD_FACTOR_DEFAULT = parseFloat(process.env.DYNAMIC_THRESHOLD_FACTOR || "0.4");
 const VOLUME_SPIKE_MULTIPLIER_DEFAULT = parseFloat(process.env.VOLUME_SPIKE_MULTIPLIER || "2.5");
 const DAILY_SUMMARY_HOUR_DEFAULT = parseInt(process.env.DAILY_SUMMARY_HOUR || "9", 10);
+const MONTHLY_CALL_BUDGET = parseInt(process.env.MONTHLY_CALL_BUDGET || "10000", 10); // سقف پلن Demo رایگان CoinGecko
 const MARKET_WIDE_THRESHOLD_DEFAULT = parseFloat(process.env.MARKET_WIDE_THRESHOLD || "2.5");
 const BREAKOUT_MIN_PERCENT_DEFAULT = parseFloat(process.env.BREAKOUT_MIN_PERCENT || "1");
 const PIVOT_REFRESH_HOURS = parseFloat(process.env.PIVOT_REFRESH_HOURS || "4");
@@ -58,6 +59,10 @@ let state = {
   dailySummaryEnabled: true,
   dailySummaryHour: DAILY_SUMMARY_HOUR_DEFAULT,
   lastSummaryDate: null,
+  apiCallMonth: null,   // "YYYY-MM" — برای تشخیص شروع ماه جدید
+  apiCallCount: 0,       // تعداد درخواست‌های CoinGecko از اول همین ماه
+  apiBudgetWarned: false, // هشدار ۹۰٪ قبلاً فرستاده شده یا نه
+  apiBudgetExhausted: false,
   marketWideThreshold: MARKET_WIDE_THRESHOLD_DEFAULT,
   newEntrantEnabled: true,
   breakoutAlertEnabled: true,
@@ -99,6 +104,43 @@ let downAlertSent = false;
 
 // ---------------- ابزارهای کمکی ----------------
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// ---------------- شمارنده‌ی مصرف ماهانه‌ی CoinGecko ----------------
+function currentMonthKey() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+function trackApiCall() {
+  const key = currentMonthKey();
+  if (state.apiCallMonth !== key) {
+    state.apiCallMonth = key;
+    state.apiCallCount = 0;
+    state.apiBudgetWarned = false;
+    state.apiBudgetExhausted = false;
+  }
+  state.apiCallCount++;
+  if (state.apiCallCount >= MONTHLY_CALL_BUDGET * 0.9 && !state.apiBudgetWarned) {
+    state.apiBudgetWarned = true;
+    sendTelegram(
+      `⚠️ به ۹۰٪ سهمیه‌ی ماهانه‌ی CoinGecko رسیدی (${state.apiCallCount}/${MONTHLY_CALL_BUDGET}).\n` +
+      `اگه تموم بشه، رصد خودکار متوقف می‌شه تا اول ماه بعد. برای جلوگیری، POLL_SECONDS رو بیشتر کن یا به پلن پولی آپگرید کن.`
+    );
+  }
+  if (state.apiCallCount >= MONTHLY_CALL_BUDGET && !state.apiBudgetExhausted) {
+    state.apiBudgetExhausted = true;
+    sendTelegram(
+      `🛑 سهمیه‌ی ماهانه‌ی CoinGecko (${MONTHLY_CALL_BUDGET} درخواست) تموم شد.\n` +
+      `همه‌ی رصد (پامپ/دامپ، آلارم قیمت، و بقیه) متوقف می‌مونه تا اول ماه میلادی بعد که سهمیه خودکار ریست بشه.\n` +
+      `برای ادامه‌ی زودتر: POLL_SECONDS رو بیشتر کن (کمتر درخواست بزنه)، یا به پلن پولی CoinGecko آپگرید کن.`
+    );
+  }
+  saveState();
+}
+function apiBudgetExceeded() {
+  const key = currentMonthKey();
+  if (state.apiCallMonth !== key) return false; // ماه عوض شده، یعنی شمارنده هنوز صفر نشده ولی باید نشون بده در دسترسه
+  return state.apiCallCount >= MONTHLY_CALL_BUDGET;
+}
 // برای درخواست‌های تکی و کم‌تکرار (مثل /alert و /profile)، یه بار دیگه هم امتحان کن اگه فقط به‌خاطر محدودیت نرخ شکست خورد
 async function withRetry(fn, retries = 1, delayMs = 3000) {
   for (let i = 0; i <= retries; i++) {
@@ -161,6 +203,7 @@ function editMessage(chatId, messageId, text, keyboard) {
 
 // ---------------- تأیید روند ۴ ساعته ----------------
 async function fetchOHLC4h(id) {
+  trackApiCall();
   const url = `https://api.coingecko.com/api/v3/coins/${id}/ohlc?vs_currency=usd&days=7`;
   const headers = {};
   if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
@@ -233,6 +276,7 @@ function getMarketContext(id, coinChangeAbs, direction) {
 
 // ---------------- دریافت داده‌ی بازار ----------------
 async function fetchMarketsPage(page) {
+  trackApiCall();
   const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}&sparkline=false`;
   const headers = {};
   if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
@@ -243,6 +287,7 @@ async function fetchMarketsPage(page) {
 }
 async function fetchMarketsByIds(ids) {
   if (!ids.length) return [];
+  trackApiCall();
   const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids.join(",")}&sparkline=false`;
   const headers = {};
   if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
@@ -252,6 +297,7 @@ async function fetchMarketsByIds(ids) {
   return res.json();
 }
 async function searchCoinBySymbol(symbol) {
+  trackApiCall();
   const url = `https://api.coingecko.com/api/v3/search?query=${encodeURIComponent(symbol)}`;
   const headers = {};
   if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
@@ -594,6 +640,7 @@ async function evaluate(now) {
 async function pollOnce() {
   const hasPriceAlerts = state.priceAlerts.length > 0;
   if (state.paused && !hasPriceAlerts) return;
+  if (apiBudgetExceeded()) return; // سهمیه‌ی ماهانه تموم شده؛ تا اول ماه بعد خودکار متوقف می‌مونه
   const now = Date.now();
   const seen = new Set();
   try {
@@ -785,10 +832,12 @@ function ensureWatched(found) {
 }
 // ---------------- مشخصات کامل یه رمزارز (/profile) ----------------
 async function fetchCoinFullStats(id) {
+  trackApiCall();
   const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${id}&price_change_percentage=1h,24h,7d`;
   const headers = {};
   if (COINGECKO_API_KEY) headers["x-cg-demo-api-key"] = COINGECKO_API_KEY;
   const res = await fetch(url, { headers });
+  if (res.status === 429) throw new Error("rate_limited_429");
   if (!res.ok) throw new Error("coingecko_failed_" + res.status);
   const data = await res.json();
   return data[0] || null;
@@ -815,9 +864,17 @@ async function cmdProfile(parts) {
   if (!found) { sendTelegram("کوینی با این نماد پیدا نشد."); return; }
   sendTelegram("در حال آماده‌سازی مشخصات...");
 
-  let stats = null, candles = null, levels = null;
+  let stats = null, candles = null, levels = null, usedFallback = false;
   try { stats = await withRetry(() => fetchCoinFullStats(found.id)); } catch (e) { /* ignore */ }
-  try { candles = await fetchOHLC4h(found.id); } catch (e) { /* ignore */ }
+  if (!stats) {
+    // مسیر پشتیبان: اگه endpoint اصلی (با پارامتر price_change_percentage) جواب نداد،
+    // حداقل داده‌ی پایه رو از همون endpoint ساده‌تری که بقیه‌ی بخش‌های ربات هم ازش استفاده می‌کنن بگیر
+    try {
+      const basic = await withRetry(() => fetchMarketsByIds([found.id]));
+      if (basic && basic[0]) { stats = basic[0]; usedFallback = true; }
+    } catch (e) { /* ignore */ }
+  }
+  try { candles = await withRetry(() => fetchOHLC4h(found.id)); } catch (e) { /* ignore */ }
   try { levels = await ensurePivotLevels(found.id); } catch (e) { /* ignore */ }
 
   if (!stats) { sendTelegram("نتونستم اطلاعات این کوین رو بگیرم؛ دوباره امتحان کن."); return; }
@@ -885,6 +942,7 @@ async function cmdProfile(parts) {
   if (isBlacklisted) statusLine += " | 🚫 مسدود";
   if (muteEntry) statusLine += ` | 🔇 ساکت تا ${fmtDateTime(muteEntry.until)}`;
   text += `وضعیت در ربات: ${statusLine}\n\n`;
+  if (usedFallback) text += `(روند ۱ساعته/هفتگی این‌بار در دسترس نبود؛ بقیه‌ی اطلاعات از منبع جایگزین گرفته شد)\n\n`;
   text += `این فقط خلاصه‌ی داده‌هاست، نه توصیه‌ی خرید یا فروش.`;
 
   sendTelegram(text, [[{ text: "📈 نمودار", url: chartLink(found.id) }]]);
@@ -1345,6 +1403,8 @@ let telegramOffset = 0;
 function statusText() {
   return "📊 وضعیت پامپ‌یاب\n" +
     `حالت: ${state.paused ? "متوقف ⏸" : "فعال ▶️"}\n` +
+    `کلید CoinGecko: ${COINGECKO_API_KEY ? "تنظیم شده ✅" : "تنظیم نشده ⚠️ (سهمیه خیلی محدوده)"}\n` +
+    `مصرف این ماه: ${state.apiCallCount || 0} از ${MONTHLY_CALL_BUDGET}${apiBudgetExceeded() ? " — 🛑 تموم شده" : ""}\n` +
     `آستانه‌ی پامپ: ${state.threshold}٪ | آستانه‌ی افت: ${state.dumpThreshold}٪\n` +
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
     `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length} | آلارم قیمت: ${state.priceAlerts.length}\n` +
@@ -1352,7 +1412,8 @@ function statusText() {
     `کوین‌های ساکت‌شده: ${state.mutes.length} | خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "ساعت " + state.dailySummaryHour + " (ایران)" : "غیرفعال"}\n` +
     `فیلتر بازار: آستانه ${state.marketWideThreshold}٪ | ورود تازه: ${state.newEntrantEnabled ? "فعال" : "غیرفعال"} | شکست ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال (" + state.breakoutMinPercent + "٪)" : "غیرفعال"}\n` +
     `مقاومت/حمایت لیست ویژه: ${state.pivotAlertEnabled ? "فعال" : "غیرفعال"}\n` +
-    `آخرین بروزرسانی: ${lastPollAt ? fmtTimeOnly(lastPollAt) : "—"}`;
+    `آخرین بروزرسانی: ${lastPollAt ? fmtTimeOnly(lastPollAt) : "—"}` +
+    (consecutiveErrors > 0 ? `\n⚠️ ${consecutiveErrors} بار پیاپی خطا در دریافت بازار (احتمال محدودیت نرخ)` : "");
 }
 function historyText() {
   if (!state.history.length) return "هنوز هشداری ثبت نشده.";
@@ -1374,9 +1435,15 @@ async function resolveSymbolToId(symbolRaw) {
   return null;
 }
 
+const BUDGET_SENSITIVE_CMDS = new Set(["/alert", "/stoploss", "/takeprofit", "/profile", "/watch", "/blacklist", "/unblacklist", "/levels", "/mute"]);
 async function handleCommand(text) {
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
+
+  if (BUDGET_SENSITIVE_CMDS.has(cmd) && apiBudgetExceeded()) {
+    sendTelegram(`🛑 سهمیه‌ی ماهانه‌ی CoinGecko تموم شده؛ این دستور تا اول ماه بعد کار نمی‌کنه. با /status می‌تونی وضعیتش رو ببینی.`);
+    return;
+  }
 
   if (cmd === "/alert") { await cmdAlert(parts); return; }
   if (cmd === "/alerts") { cmdAlerts(parts); return; }
