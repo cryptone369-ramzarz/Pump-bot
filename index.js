@@ -15,7 +15,14 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5");
 const POLL_SECONDS       = parseFloat(process.env.POLL_SECONDS || "15");
 const PAGES              = parseInt(process.env.PAGES || "1", 10);
-const COINGECKO_API_KEY  = process.env.COINGECKO_API_KEY || "";
+const COINGECKO_API_KEY_RAW = process.env.COINGECKO_API_KEY || "";
+const COINGECKO_API_KEY  = COINGECKO_API_KEY_RAW.trim().replace(/^["']|["']$/g, "");
+if (COINGECKO_API_KEY_RAW && COINGECKO_API_KEY_RAW !== COINGECKO_API_KEY) {
+  console.warn("⚠️ COINGECKO_API_KEY فاصله یا گیومه‌ی اضافه داشت؛ خودکار پاک‌سازی شد. مقدار واقعی رو توی Railway هم همین‌طور پاکیزه کن.");
+}
+if (COINGECKO_API_KEY) {
+  console.log(`کلید CoinGecko طول: ${COINGECKO_API_KEY.length} کاراکتر، شروع: ${COINGECKO_API_KEY.slice(0, 6)}...`);
+}
 const MIN_VOLUME_USD     = parseFloat(process.env.MIN_VOLUME_USD || "5000000");
 const WINDOWS_MINUTES = (process.env.WINDOWS_MINUTES || "1,5,15")
   .split(",").map((s) => parseFloat(s.trim())).filter((n) => !isNaN(n) && n > 0);
@@ -1403,7 +1410,7 @@ let telegramOffset = 0;
 function statusText() {
   return "📊 وضعیت پامپ‌یاب\n" +
     `حالت: ${state.paused ? "متوقف ⏸" : "فعال ▶️"}\n` +
-    `کلید CoinGecko: ${COINGECKO_API_KEY ? "تنظیم شده ✅" : "تنظیم نشده ⚠️ (سهمیه خیلی محدوده)"}\n` +
+    `کلید CoinGecko: ${COINGECKO_API_KEY ? `تنظیم شده ✅ (${COINGECKO_API_KEY.length} کاراکتر، شروع با ${COINGECKO_API_KEY.slice(0, 6)}...)` : "تنظیم نشده ⚠️ (سهمیه خیلی محدوده)"}\n` +
     `مصرف این ماه: ${state.apiCallCount || 0} از ${MONTHLY_CALL_BUDGET}${apiBudgetExceeded() ? " — 🛑 تموم شده" : ""}\n` +
     `آستانه‌ی پامپ: ${state.threshold}٪ | آستانه‌ی افت: ${state.dumpThreshold}٪\n` +
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
