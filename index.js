@@ -14,6 +14,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5");
 const POLL_SECONDS       = parseFloat(process.env.POLL_SECONDS || "15");
+const FAST_POLL_SECONDS  = parseFloat(process.env.FAST_POLL_SECONDS || "30"); // فقط برای لیست ویژه/آلارم قیمت، جدا از رصد کل بازار
+const FAST_POLL_ENABLED_DEFAULT = (process.env.FAST_POLL_ENABLED || "true").toLowerCase() !== "false";
 const PAGES              = parseInt(process.env.PAGES || "1", 10);
 const COINGECKO_API_KEY_RAW = process.env.COINGECKO_API_KEY || "";
 const COINGECKO_API_KEY  = COINGECKO_API_KEY_RAW.trim().replace(/^["']|["']$/g, "");
@@ -76,6 +78,7 @@ let state = {
   breakoutMinPercent: BREAKOUT_MIN_PERCENT_DEFAULT,
   pivotAlertEnabled: true,
   pivotHysteresisPercent: PIVOT_HYSTERESIS_DEFAULT,
+  fastPollEnabled: FAST_POLL_ENABLED_DEFAULT,
 };
 function loadState() {
   try {
@@ -535,9 +538,12 @@ function checkBreakout(c, now, isWatched) {
 }
 
 // ---------------- ارزیابی و اطلاع‌رسانی ----------------
-async function evaluate(now) {
+async function evaluate(now, idsFilter) {
   const watchIds = new Set(state.watchlist.map((w) => w.id));
-  for (const [id, arr] of history.entries()) {
+  const entries = idsFilter
+    ? Array.from(idsFilter).map((id) => [id, history.get(id)]).filter(([, arr]) => arr)
+    : Array.from(history.entries());
+  for (const [id, arr] of entries) {
     if (arr.length < 2) continue;
     const m = meta.get(id);
     if (!m) continue;
@@ -668,29 +674,31 @@ async function pollOnce() {
       }
       checkNewEntrants(rankedIds);
     }
-    // کوین‌هایی که آلارم قیمت یا واچ‌لیست دارن ولی توی صفحات بالا نبودن، هر بار جدا به‌روز می‌شن
-    const wanted = new Set(state.priceAlerts.map((a) => a.coinId));
-    if (!state.paused) state.watchlist.forEach((w) => wanted.add(w.id));
-    const missing = Array.from(wanted).filter((id) => !seen.has(id));
-    if (missing.length) {
-      if (seen.size) await sleep(1200);
-      const extra = await fetchMarketsByIds(missing);
-      for (const c of extra) {
-        if (!c.current_price) continue;
-        meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
-        pushPrice(c.id, c.current_price, now);
-        updateBaselines(c, now);
-        checkBreakout(c, now, true); // این حلقه فقط برای واچ‌لیست/کوین‌های گم‌شده‌ست
-        seen.add(c.id);
+    // اگه رصد سریع لیست ویژه خاموشه، همین حلقه‌ی اصلی وظیفه‌ی به‌روزکردن واچ‌لیست/آلارم‌ها رو هم بر عهده می‌گیره
+    if (!state.fastPollEnabled) {
+      const wanted = new Set(state.priceAlerts.map((a) => a.coinId));
+      if (!state.paused) state.watchlist.forEach((w) => wanted.add(w.id));
+      const missing = Array.from(wanted).filter((id) => !seen.has(id));
+      if (missing.length) {
+        if (seen.size) await sleep(1200);
+        const extra = await fetchMarketsByIds(missing);
+        for (const c of extra) {
+          if (!c.current_price) continue;
+          meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
+          pushPrice(c.id, c.current_price, now);
+          updateBaselines(c, now);
+          checkBreakout(c, now, true);
+          seen.add(c.id);
+        }
       }
+      for (const w of state.watchlist) {
+        const arr = history.get(w.id);
+        if (arr && arr.length) await checkPivotCrossings(w.id, arr[arr.length - 1].p, w.symbol, w.name);
+      }
+      checkPriceAlerts(now);
     }
     cleanupMutes(now);
-    if (!state.paused) await evaluate(now);
-    for (const w of state.watchlist) {
-      const arr = history.get(w.id);
-      if (arr && arr.length) await checkPivotCrossings(w.id, arr[arr.length - 1].p, w.symbol, w.name);
-    }
-    checkPriceAlerts(now);
+    if (!state.paused) await evaluate(now, state.fastPollEnabled ? new Set(rankedIds) : undefined);
     lastPollAt = now;
     if (downAlertSent) sendTelegram("✅ اتصال به بازار دوباره برقرار شد.");
     consecutiveErrors = 0;
@@ -703,6 +711,41 @@ async function pollOnce() {
       downAlertSent = true;
       sendTelegram("⚠️ چند بار پیاپی نتونستم اطلاعات بازار رو بگیرم؛ احتمال مشکل در اتصال یا محدودیت API هست.");
     }
+  }
+}
+
+// ---------------- رصد سریع و سبک، فقط برای لیست ویژه و آلارم قیمت ----------------
+// این حلقه جدا از رصد کل بازاره: فقط کوین‌های واچ‌لیست/آلارم قیمت رو با یه درخواست واحد
+// می‌گیره، پس می‌شه خیلی بیشتر از POLL_SECONDS اصلی تکرارش کرد بدون فشار زیاد به سهمیه.
+async function pollWatchlistOnly() {
+  if (!state.fastPollEnabled) return;
+  if (state.paused) return;
+  if (apiBudgetExceeded()) return;
+  const wanted = new Set(state.priceAlerts.map((a) => a.coinId));
+  state.watchlist.forEach((w) => wanted.add(w.id));
+  if (!wanted.size) return; // چیزی برای رصد سریع نیست، لازم نیست درخواستی بزنیم
+  const now = Date.now();
+  try {
+    const ids = Array.from(wanted);
+    const coins = await fetchMarketsByIds(ids);
+    const updatedIds = new Set();
+    for (const c of coins) {
+      if (!c.current_price) continue;
+      meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
+      pushPrice(c.id, c.current_price, now);
+      updateBaselines(c, now);
+      checkBreakout(c, now, true);
+      updatedIds.add(c.id);
+    }
+    await evaluate(now, updatedIds);
+    for (const w of state.watchlist) {
+      const arr = history.get(w.id);
+      if (arr && arr.length) await checkPivotCrossings(w.id, arr[arr.length - 1].p, w.symbol, w.name);
+    }
+    checkPriceAlerts(now);
+  } catch (err) {
+    if (err.message === "rate_limited_429") console.error("محدودیت نرخ CoinGecko (429) در رصد سریع لیست ویژه.");
+    else console.error("خطا در رصد سریع لیست ویژه:", err.message);
   }
 }
 
@@ -1194,7 +1237,8 @@ function menuLists() {
 function menuVip() {
   return {
     text: "📊 لیست ویژه\n\n" +
-      `مقاومت/حمایت: ${state.pivotAlertEnabled ? "فعال ✅ (منطقه‌ی امن " + state.pivotHysteresisPercent + "٪)" : "غیرفعال ⏹"}\n\n` +
+      `مقاومت/حمایت: ${state.pivotAlertEnabled ? "فعال ✅ (منطقه‌ی امن " + state.pivotHysteresisPercent + "٪)" : "غیرفعال ⏹"}\n` +
+      `رصد سریع: ${state.fastPollEnabled ? "فعال ✅ (هر " + FAST_POLL_SECONDS + " ثانیه)" : "غیرفعال ⏹"}\n\n` +
       "دستورات:\n" +
       "/profile BTC — مشخصات کامل (قیمت، روندها، سقف/کف، مقاومت/حمایت، حجم، وضعیت نسبت به بازار)\n" +
       "/levels BTC — فقط مقاومت/حمایت فعلی\n" +
@@ -1204,6 +1248,7 @@ function menuVip() {
     keyboard: [
       [{ text: "⭐ نمایش واچ‌لیست کامل", callback_data: "show:watchlist" }],
       [{ text: state.pivotAlertEnabled ? "⏹ خاموش‌کردن مقاومت/حمایت" : "✅ روشن‌کردن مقاومت/حمایت", callback_data: "toggle:pivotAlertEnabled:vip" }],
+      [{ text: state.fastPollEnabled ? "⏹ خاموش‌کردن رصد سریع" : "✅ روشن‌کردن رصد سریع", callback_data: "toggle:fastPollEnabled:vip" }],
       [{ text: "🔙 منو", callback_data: "menu:main" }],
     ],
   };
@@ -1331,6 +1376,7 @@ const CMD_GUIDE = {
   stoploss: { usage: "/stoploss [SYMBOL] [قیمت]", desc: "حد ضرر ثبت می‌کنه (باید پایین‌تر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🛑 می‌گیری.", example: "/stoploss BTC 60000" },
   takeprofit: { usage: "/takeprofit [SYMBOL] [قیمت]", desc: "حد سود ثبت می‌کنه (باید بالاتر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🎯 می‌گیری.", example: "/takeprofit BTC 80000" },
   pivot: { usage: "/pivot on  یا  /pivot off", desc: "روشن/خاموش‌کردن هشدار شکست مقاومت/حمایت برای کوین‌های لیست ویژه.", example: null },
+  fastpoll: { usage: "/fastpoll on  یا  /fastpoll off", desc: "رصد سریع و جدا برای لیست ویژه/آلارم قیمت (پیش‌فرض هر 30 ثانیه)، مستقل از بازه‌ی رصد کل بازار. چون فقط همون چندتا کوین خاص رو می‌گیره (نه کل بازار)، خیلی کم‌هزینه‌تر از زیادکردن سرعت کل رصده.", example: null },
   pivotbuffer: { usage: "/pivotbuffer [عدد]", desc: "یه منطقه‌ی امن دور هر سطح مقاومت/حمایت (به درصد) تا وقتی قیمت دقیقاً روی مرز نوسان می‌کنه، هشدار تکراری نیاد. پیش‌فرض 0.5٪.", example: "/pivotbuffer 0.5" },
   profile: { usage: "/profile [SYMBOL]", desc: "مشخصات کامل یه رمزارز: قیمت، روند ۱ساعته/۴ساعته/روزانه/هفتگی، سقف و کف ۲۴ساعته، مقاومت و حمایت، حد ضرر/سود فعال، حجم معاملات، و وضعیت نسبت به بیت‌کوین. همه‌چی یک‌جا.", example: "/profile BTC" },
 
@@ -1345,6 +1391,8 @@ const CMD_GUIDE = {
   dailysummary: { usage: "/dailysummary on  یا  /dailysummary off", desc: "یه پیام خلاصه هر روز (پیش‌فرض ساعت ۹ صبح ایران) با آمار ۲۴ ساعت اخیر.", example: null },
   summaryhour: { usage: "/summaryhour [۰ تا ۲۳]", desc: "ساعت ارسال خلاصه‌ی روزانه رو تغییر می‌ده (به وقت ایران).", example: "/summaryhour 9" },
   summarynow: { usage: "/summarynow", desc: "خلاصه‌ی روزانه رو همین الان می‌فرسته، بدون نیاز به صبر تا فردا (خوبه برای تست).", example: null },
+  apiusage: { usage: "/apiusage", desc: "مصرف این ماه از سهمیه‌ی CoinGecko رو نشون می‌ده.", example: null },
+  setapiusage: { usage: "/setapiusage [عدد]", desc: "شمارنده‌ی داخلی رو با عدد واقعی داشبورد CoinGecko هماهنگ می‌کنه.", example: "/setapiusage 10010" },
 
   newentrant: { usage: "/newentrant on  یا  /newentrant off", desc: "هشدار وقتی یه کوین تازه وارد لیست ۲۵۰/۵۰۰ کوین برتر بازار می‌شه — معمولاً نشونه‌ی رشد یا لیستینگ مهمه.", example: null },
   breakout: { usage: "/breakout on  یا  /breakout off", desc: "هشدار وقتی قیمت یه کوین از سقف یا کف ۲۴ساعته‌ی قبلی‌ش رد می‌شه.", example: null },
@@ -1368,9 +1416,9 @@ const GUIDE_SECTIONS = {
   volume: { title: "📢 حجم معاملات", cmds: ["volumealert", "volumefactor"] },
   lists: { title: "⭐ واچ‌لیست و لیست سیاه", cmds: ["watch", "unwatch", "watchlist", "blacklist", "unblacklist", "blacklistshow"] },
   mute: { title: "🔇 سکوت موقت", cmds: ["mute", "unmute", "mutes"] },
-  vip: { title: "📊 لیست ویژه (مقاومت/حمایت/حد ضرر/سود)", cmds: ["levels", "stoploss", "takeprofit", "pivot", "pivotbuffer", "profile"] },
+  vip: { title: "📊 لیست ویژه (مقاومت/حمایت/حد ضرر/سود)", cmds: ["levels", "stoploss", "takeprofit", "pivot", "pivotbuffer", "profile", "fastpoll"] },
   pricealerts: { title: "🔔 آلارم قیمت", cmds: ["alert", "alerts", "delalert"] },
-  reports: { title: "📋 گزارش و تاریخچه", cmds: ["report", "history", "backtest", "export", "dailysummary", "summaryhour", "summarynow"] },
+  reports: { title: "📋 گزارش و تاریخچه", cmds: ["report", "history", "backtest", "export", "dailysummary", "summaryhour", "summarynow", "apiusage", "setapiusage"] },
   advanced: { title: "🧪 هشدارهای پیشرفته", cmds: ["newentrant", "breakout", "breakoutfactor"] },
 };
 
@@ -1415,6 +1463,7 @@ function statusText() {
     `آستانه‌ی پامپ: ${state.threshold}٪ | آستانه‌ی افت: ${state.dumpThreshold}٪\n` +
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
     `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length} | آلارم قیمت: ${state.priceAlerts.length}\n` +
+    `رصد عمومی: هر ${POLL_SECONDS} ثانیه | رصد سریع لیست ویژه: ${state.fastPollEnabled ? "فعال، هر " + FAST_POLL_SECONDS + " ثانیه ✅" : "غیرفعال ⏹"}\n` +
     `آستانه‌ی پویا: ${state.dynamicEnabled ? "فعال (ضریب " + state.dynamicFactor + ")" : "غیرفعال"} | هشدار حجم: ${state.volumeAlertEnabled ? "فعال (×" + state.volumeSpikeMultiplier + ")" : "غیرفعال"}\n` +
     `کوین‌های ساکت‌شده: ${state.mutes.length} | خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "ساعت " + state.dailySummaryHour + " (ایران)" : "غیرفعال"}\n` +
     `فیلتر بازار: آستانه ${state.marketWideThreshold}٪ | ورود تازه: ${state.newEntrantEnabled ? "فعال" : "غیرفعال"} | شکست ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال (" + state.breakoutMinPercent + "٪)" : "غیرفعال"}\n` +
@@ -1661,6 +1710,35 @@ async function handleCommand(text) {
   }
   if (cmd === "/summarynow") { sendTelegram(buildDailySummaryText()); return; }
 
+  if (cmd === "/setapiusage") {
+    const v = parseInt((parts[1] || "").replace(/,/g, ""), 10);
+    if (isNaN(v) || v < 0) { sendTelegram("عدد نامعتبر. مثال: /setapiusage 10010\n(همون عددی که توی داشبورد CoinGecko زیر «Monthly Credit Usage» می‌بینی)"); return; }
+    state.apiCallMonth = currentMonthKey();
+    state.apiCallCount = v;
+    state.apiBudgetWarned = v >= MONTHLY_CALL_BUDGET * 0.9;
+    state.apiBudgetExhausted = v >= MONTHLY_CALL_BUDGET;
+    saveState();
+    sendTelegram(
+      `✅ مصرف این ماه روی ${v} از ${MONTHLY_CALL_BUDGET} هماهنگ شد.` +
+      (state.apiBudgetExhausted ? `\n🛑 چون به سقف رسیده، رصد خودکار تا اول ماه بعد متوقف می‌مونه.` : "")
+    );
+    return;
+  }
+  if (cmd === "/fastpoll") {
+    if (parts[1] === "on") { state.fastPollEnabled = true; saveState(); sendTelegram(`✅ رصد سریع لیست ویژه فعال شد (هر ${FAST_POLL_SECONDS} ثانیه).`); }
+    else if (parts[1] === "off") { state.fastPollEnabled = false; saveState(); sendTelegram("⏹ رصد سریع لیست ویژه غیرفعال شد؛ از این به بعد لیست ویژه هم فقط توی رصد اصلی (POLL_SECONDS) به‌روز می‌شه."); }
+    else sendTelegram("مثال: /fastpoll on   یا   /fastpoll off");
+    return;
+  }
+  if (cmd === "/apiusage") {
+    sendTelegram(
+      `📊 مصرف CoinGecko این ماه: ${state.apiCallCount || 0} از ${MONTHLY_CALL_BUDGET}` +
+      (apiBudgetExceeded() ? " — 🛑 تموم شده" : state.apiCallCount >= MONTHLY_CALL_BUDGET * 0.9 ? " — ⚠️ نزدیک به سقف" : " — ✅ عادی") +
+      `\n\nاین عدد فقط از زمانی که این قابلیت اضافه شد حساب می‌شه. اگه با داشبورد خودِ CoinGecko فرق داشت، با /setapiusage هماهنگش کن.`
+    );
+    return;
+  }
+
   if (cmd === "/marketwide") {
     const v = parseFloat(parts[1]);
     if (!isNaN(v) && v > 0) { state.marketWideThreshold = v; saveState(); sendTelegram(`✅ آستانه‌ی حرکت کل بازار روی ${v}٪ تنظیم شد.`); }
@@ -1816,6 +1894,9 @@ const BOT_COMMANDS = [
   { command: "pivot", description: "روشن/خاموش شکست مقاومت/حمایت" },
   { command: "pivotbuffer", description: "منطقه‌ی امن دور سطوح مقاومت/حمایت" },
   { command: "profile", description: "مشخصات کامل یه رمزارز" },
+  { command: "apiusage", description: "مصرف این ماه از سهمیه‌ی CoinGecko" },
+  { command: "setapiusage", description: "هماهنگ‌کردن شمارنده با داشبورد CoinGecko" },
+  { command: "fastpoll", description: "رصد سریع جدا برای لیست ویژه" },
 ];
 async function registerBotUI() {
   try {
@@ -1848,6 +1929,7 @@ function start() {
   registerBotUI();
   pollOnce();
   setInterval(pollOnce, POLL_SECONDS * 1000);
+  setInterval(pollWatchlistOnly, FAST_POLL_SECONDS * 1000);
   setInterval(pollTelegramCommands, 4000);
   setInterval(checkDailySummary, 60000);
 }
