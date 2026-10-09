@@ -16,6 +16,9 @@ const HYSTERESIS_PERCENT = parseFloat(process.env.HYSTERESIS_PERCENT || "1.5");
 const POLL_SECONDS       = parseFloat(process.env.POLL_SECONDS || "15");
 const FAST_POLL_SECONDS  = parseFloat(process.env.FAST_POLL_SECONDS || "30"); // فقط برای لیست ویژه/آلارم قیمت، جدا از رصد کل بازار
 const FAST_POLL_ENABLED_DEFAULT = (process.env.FAST_POLL_ENABLED || "true").toLowerCase() !== "false";
+const PAPRIKA_POLL_SECONDS = parseFloat(process.env.PAPRIKA_POLL_SECONDS || "30"); // رصد عمومی پامپ/دامپ، جدا و ارزون‌تر از CoinGecko
+const PAPRIKA_ENABLED_DEFAULT = (process.env.PAPRIKA_ENABLED || "true").toLowerCase() !== "false";
+const PAPRIKA_MONTHLY_BUDGET = parseInt(process.env.PAPRIKA_MONTHLY_BUDGET || "18000", 10); // کمی پایین‌تر از سقف واقعی ۲۰هزارتایی، برای حاشیه‌ی امن
 const PAGES              = parseInt(process.env.PAGES || "1", 10);
 const COINGECKO_API_KEY_RAW = process.env.COINGECKO_API_KEY || "";
 const COINGECKO_API_KEY  = COINGECKO_API_KEY_RAW.trim().replace(/^["']|["']$/g, "");
@@ -79,6 +82,9 @@ let state = {
   pivotAlertEnabled: true,
   pivotHysteresisPercent: PIVOT_HYSTERESIS_DEFAULT,
   fastPollEnabled: FAST_POLL_ENABLED_DEFAULT,
+  paprikaEnabled: PAPRIKA_ENABLED_DEFAULT,
+  paprikaCallMonth: null,
+  paprikaCallCount: 0,
 };
 function loadState() {
   try {
@@ -100,6 +106,7 @@ const notifiedPump = new Map();
 const notifiedDump = new Map();
 const notifiedVolume = new Map();
 const prevExtremes = new Map(); // id -> {high, low}  (برای تشخیص شکست سقف/کف ۲۴ ساعته)
+const symbolToGeckoId = new Map(); // "BTC" -> "bitcoin"  (برای وصل‌کردن داده‌ی CoinPaprika به شناسه‌های CoinGecko)
 const pivotLevels = new Map();     // id -> {levels:{P,R1,R2,R3,S1,S2,S3}, computedAt}
 const pivotCrossState = new Map(); // id -> {R1:"above"|"below", ...}
 let previousTopIds = new Set();  // برای تشخیص ورود تازه به لیست برتر
@@ -150,6 +157,24 @@ function apiBudgetExceeded() {
   const key = currentMonthKey();
   if (state.apiCallMonth !== key) return false; // ماه عوض شده، یعنی شمارنده هنوز صفر نشده ولی باید نشون بده در دسترسه
   return state.apiCallCount >= MONTHLY_CALL_BUDGET;
+}
+function trackPaprikaCall() {
+  const key = currentMonthKey();
+  if (state.paprikaCallMonth !== key) { state.paprikaCallMonth = key; state.paprikaCallCount = 0; }
+  state.paprikaCallCount++;
+  saveState();
+}
+function paprikaBudgetExceeded() {
+  const key = currentMonthKey();
+  if (state.paprikaCallMonth !== key) return false;
+  return state.paprikaCallCount >= PAPRIKA_MONTHLY_BUDGET;
+}
+async function fetchPaprikaTickers() {
+  trackPaprikaCall();
+  const res = await fetch("https://api.coinpaprika.com/v1/tickers");
+  if (res.status === 429) throw new Error("rate_limited_429");
+  if (!res.ok) throw new Error("paprika_failed_" + res.status);
+  return res.json();
 }
 // برای درخواست‌های تکی و کم‌تکرار (مثل /alert و /profile)، یه بار دیگه هم امتحان کن اگه فقط به‌خاطر محدودیت نرخ شکست خورد
 async function withRetry(fn, retries = 1, delayMs = 3000) {
@@ -659,6 +684,7 @@ async function pollOnce() {
   try {
     const rankedIds = [];
     if (!state.paused) {
+      symbolToGeckoId.clear(); // هر چرخه‌ی رصد اصلی، نقشه‌ی نماد→شناسه از نو ساخته می‌شه (ترتیب بر اساس ارزش‌بازاره، پس برخورد نماد با رتبه‌ی بالاتر برنده‌ست)
       for (let p = 1; p <= PAGES; p++) {
         const coins = await fetchMarketsPage(p);
         for (const c of coins) {
@@ -669,6 +695,8 @@ async function pollOnce() {
           checkBreakout(c, now, state.watchlist.some((w) => w.id === c.id));
           seen.add(c.id);
           rankedIds.push(c.id);
+          const symU = (c.symbol || "").toUpperCase();
+          if (symU && !symbolToGeckoId.has(symU)) symbolToGeckoId.set(symU, c.id);
         }
         if (p < PAGES) await sleep(2000);
       }
@@ -746,6 +774,38 @@ async function pollWatchlistOnly() {
   } catch (err) {
     if (err.message === "rate_limited_429") console.error("محدودیت نرخ CoinGecko (429) در رصد سریع لیست ویژه.");
     else console.error("خطا در رصد سریع لیست ویژه:", err.message);
+  }
+}
+
+// ---------------- رصد عمومی پامپ/دامپ از CoinPaprika (ارزون‌تر، مستقل از سهمیه‌ی CoinGecko) ----------------
+// این حلقه شکست سقف/کف رو چک نمی‌کنه (اون همچنان روی CoinGecko و با رصد اصلیه)؛
+// فقط قیمت‌های کل بازار رو تازه نگه می‌داره تا پامپ/دامپ/جهش‌حجم سریع‌تر و بدون فشار به CoinGecko تشخیص داده بشه.
+async function pollPaprikaFast() {
+  if (!state.paprikaEnabled) return;
+  if (state.paused) return;
+  if (paprikaBudgetExceeded()) return;
+  if (!symbolToGeckoId.size) return; // هنوز نقشه‌ی نمادها از رصد اصلی CoinGecko آماده نشده
+  const now = Date.now();
+  try {
+    const tickers = await fetchPaprikaTickers();
+    const updatedIds = new Set();
+    for (const t of tickers) {
+      const sym = (t.symbol || "").toUpperCase();
+      const id = symbolToGeckoId.get(sym);
+      if (!id) continue; // کوینی که روی CoinGecko شناسایی نشده، فعلاً نادیده گرفته می‌شه
+      const q = t.quotes && t.quotes.USD;
+      if (!q || !q.price) continue;
+      const prevMeta = meta.get(id) || { name: t.name, symbol: t.symbol };
+      meta.set(id, Object.assign({}, prevMeta, {
+        volume: q.volume_24h != null ? q.volume_24h : prevMeta.volume,
+        change24h: q.percent_change_24h != null ? q.percent_change_24h : prevMeta.change24h,
+      }));
+      pushPrice(id, q.price, now);
+      updatedIds.add(id);
+    }
+    if (updatedIds.size) await evaluate(now, updatedIds);
+  } catch (err) {
+    if (err.message !== "rate_limited_429") console.error("خطا در رصد سریع CoinPaprika:", err.message);
   }
 }
 
@@ -1290,7 +1350,8 @@ function menuAdvanced() {
       `هشدار جهش حجم: ${state.volumeAlertEnabled ? "فعال ✅" : "غیرفعال ⏹"} (×${state.volumeSpikeMultiplier})\n` +
       `خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "فعال ✅ (ساعت " + state.dailySummaryHour + ")" : "غیرفعال ⏹"}\n` +
       `ورود تازه به لیست برتر: ${state.newEntrantEnabled ? "فعال ✅" : "غیرفعال ⏹"}\n` +
-      `شکست سقف/کف ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال ✅ (" + state.breakoutMinPercent + "٪)" : "غیرفعال ⏹"}\n\n` +
+      `شکست سقف/کف ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال ✅ (" + state.breakoutMinPercent + "٪)" : "غیرفعال ⏹"}\n` +
+      `رصد عمومی CoinPaprika: ${state.paprikaEnabled ? "فعال ✅ (هر " + PAPRIKA_POLL_SECONDS + " ثانیه)" : "غیرفعال ⏹"}\n\n` +
       "(مقاومت/حمایت لیست ویژه رو از بخش «📊 لیست ویژه» کنترل کن)",
     keyboard: [
       [{ text: state.dynamicEnabled ? "⏹ خاموش‌کردن آستانه‌ی پویا" : "✅ روشن‌کردن آستانه‌ی پویا", callback_data: "toggle:dynamicEnabled:advanced" }],
@@ -1298,6 +1359,7 @@ function menuAdvanced() {
       [{ text: state.dailySummaryEnabled ? "⏹ خاموش‌کردن خلاصه‌ی روزانه" : "✅ روشن‌کردن خلاصه‌ی روزانه", callback_data: "toggle:dailySummaryEnabled:advanced" }],
       [{ text: state.newEntrantEnabled ? "⏹ خاموش‌کردن ورود تازه" : "✅ روشن‌کردن ورود تازه", callback_data: "toggle:newEntrantEnabled:advanced" }],
       [{ text: state.breakoutAlertEnabled ? "⏹ خاموش‌کردن شکست سقف/کف" : "✅ روشن‌کردن شکست سقف/کف", callback_data: "toggle:breakoutAlertEnabled:advanced" }],
+      [{ text: state.paprikaEnabled ? "⏹ خاموش‌کردن رصد CoinPaprika" : "✅ روشن‌کردن رصد CoinPaprika", callback_data: "toggle:paprikaEnabled:advanced" }],
       [{ text: "🔙 منو", callback_data: "menu:main" }],
     ],
   };
@@ -1377,6 +1439,7 @@ const CMD_GUIDE = {
   takeprofit: { usage: "/takeprofit [SYMBOL] [قیمت]", desc: "حد سود ثبت می‌کنه (باید بالاتر از قیمت فعلی باشه). کوین خودکار به لیست ویژه هم اضافه می‌شه. وقتی قیمت به این حد برسه، پیام 🎯 می‌گیری.", example: "/takeprofit BTC 80000" },
   pivot: { usage: "/pivot on  یا  /pivot off", desc: "روشن/خاموش‌کردن هشدار شکست مقاومت/حمایت برای کوین‌های لیست ویژه.", example: null },
   fastpoll: { usage: "/fastpoll on  یا  /fastpoll off", desc: "رصد سریع و جدا برای لیست ویژه/آلارم قیمت (پیش‌فرض هر 30 ثانیه)، مستقل از بازه‌ی رصد کل بازار. چون فقط همون چندتا کوین خاص رو می‌گیره (نه کل بازار)، خیلی کم‌هزینه‌تر از زیادکردن سرعت کل رصده.", example: null },
+  paprika: { usage: "/paprika on  یا  /paprika off", desc: "رصد عمومی پامپ/دامپ کل بازار از CoinPaprika (رایگان، بدون کلید، سهمیه‌ی ماهانه‌ی جدا و بیشتر از CoinGecko). شکست سقف/کف همچنان از CoinGecko میاد؛ این فقط پامپ/دامپ/جهش‌حجم رو سریع‌تر و بدون فشار به سهمیه‌ی CoinGecko تشخیص می‌ده.", example: null },
   pivotbuffer: { usage: "/pivotbuffer [عدد]", desc: "یه منطقه‌ی امن دور هر سطح مقاومت/حمایت (به درصد) تا وقتی قیمت دقیقاً روی مرز نوسان می‌کنه، هشدار تکراری نیاد. پیش‌فرض 0.5٪.", example: "/pivotbuffer 0.5" },
   profile: { usage: "/profile [SYMBOL]", desc: "مشخصات کامل یه رمزارز: قیمت، روند ۱ساعته/۴ساعته/روزانه/هفتگی، سقف و کف ۲۴ساعته، مقاومت و حمایت، حد ضرر/سود فعال، حجم معاملات، و وضعیت نسبت به بیت‌کوین. همه‌چی یک‌جا.", example: "/profile BTC" },
 
@@ -1419,7 +1482,7 @@ const GUIDE_SECTIONS = {
   vip: { title: "📊 لیست ویژه (مقاومت/حمایت/حد ضرر/سود)", cmds: ["levels", "stoploss", "takeprofit", "pivot", "pivotbuffer", "profile", "fastpoll"] },
   pricealerts: { title: "🔔 آلارم قیمت", cmds: ["alert", "alerts", "delalert"] },
   reports: { title: "📋 گزارش و تاریخچه", cmds: ["report", "history", "backtest", "export", "dailysummary", "summaryhour", "summarynow", "apiusage", "setapiusage"] },
-  advanced: { title: "🧪 هشدارهای پیشرفته", cmds: ["newentrant", "breakout", "breakoutfactor"] },
+  advanced: { title: "🧪 هشدارهای پیشرفته", cmds: ["newentrant", "breakout", "breakoutfactor", "paprika"] },
 };
 
 function formatCmdGuide(name) {
@@ -1463,7 +1526,9 @@ function statusText() {
     `آستانه‌ی پامپ: ${state.threshold}٪ | آستانه‌ی افت: ${state.dumpThreshold}٪\n` +
     `بازه‌ها: ${WINDOWS_MINUTES.join("، ")} دقیقه | حداقل حجم: $${fmtNum(MIN_VOLUME_USD)}\n` +
     `کوین‌های تحت رصد: ${history.size} | واچ‌لیست: ${state.watchlist.length} | لیست سیاه: ${state.blacklist.length} | آلارم قیمت: ${state.priceAlerts.length}\n` +
-    `رصد عمومی: هر ${POLL_SECONDS} ثانیه | رصد سریع لیست ویژه: ${state.fastPollEnabled ? "فعال، هر " + FAST_POLL_SECONDS + " ثانیه ✅" : "غیرفعال ⏹"}\n` +
+    `رصد اصلی CoinGecko (شکست سقف/کف): هر ${POLL_SECONDS} ثانیه\n` +
+    `رصد سریع لیست ویژه: ${state.fastPollEnabled ? "فعال، هر " + FAST_POLL_SECONDS + " ثانیه ✅" : "غیرفعال ⏹"}\n` +
+    `رصد عمومی پامپ/دامپ از CoinPaprika: ${state.paprikaEnabled ? "فعال، هر " + PAPRIKA_POLL_SECONDS + " ثانیه ✅" : "غیرفعال ⏹"} (مصرف این ماه: ${state.paprikaCallCount || 0} از ${PAPRIKA_MONTHLY_BUDGET})\n` +
     `آستانه‌ی پویا: ${state.dynamicEnabled ? "فعال (ضریب " + state.dynamicFactor + ")" : "غیرفعال"} | هشدار حجم: ${state.volumeAlertEnabled ? "فعال (×" + state.volumeSpikeMultiplier + ")" : "غیرفعال"}\n` +
     `کوین‌های ساکت‌شده: ${state.mutes.length} | خلاصه‌ی روزانه: ${state.dailySummaryEnabled ? "ساعت " + state.dailySummaryHour + " (ایران)" : "غیرفعال"}\n` +
     `فیلتر بازار: آستانه ${state.marketWideThreshold}٪ | ورود تازه: ${state.newEntrantEnabled ? "فعال" : "غیرفعال"} | شکست ۲۴ساعته: ${state.breakoutAlertEnabled ? "فعال (" + state.breakoutMinPercent + "٪)" : "غیرفعال"}\n` +
@@ -1724,6 +1789,12 @@ async function handleCommand(text) {
     );
     return;
   }
+  if (cmd === "/paprika") {
+    if (parts[1] === "on") { state.paprikaEnabled = true; saveState(); sendTelegram(`✅ رصد عمومی CoinPaprika فعال شد (هر ${PAPRIKA_POLL_SECONDS} ثانیه).`); }
+    else if (parts[1] === "off") { state.paprikaEnabled = false; saveState(); sendTelegram("⏹ رصد عمومی CoinPaprika غیرفعال شد؛ پامپ/دامپ فقط با سرعت رصد اصلی CoinGecko چک می‌شه."); }
+    else sendTelegram("مثال: /paprika on   یا   /paprika off");
+    return;
+  }
   if (cmd === "/fastpoll") {
     if (parts[1] === "on") { state.fastPollEnabled = true; saveState(); sendTelegram(`✅ رصد سریع لیست ویژه فعال شد (هر ${FAST_POLL_SECONDS} ثانیه).`); }
     else if (parts[1] === "off") { state.fastPollEnabled = false; saveState(); sendTelegram("⏹ رصد سریع لیست ویژه غیرفعال شد؛ از این به بعد لیست ویژه هم فقط توی رصد اصلی (POLL_SECONDS) به‌روز می‌شه."); }
@@ -1897,6 +1968,7 @@ const BOT_COMMANDS = [
   { command: "apiusage", description: "مصرف این ماه از سهمیه‌ی CoinGecko" },
   { command: "setapiusage", description: "هماهنگ‌کردن شمارنده با داشبورد CoinGecko" },
   { command: "fastpoll", description: "رصد سریع جدا برای لیست ویژه" },
+  { command: "paprika", description: "رصد عمومی پامپ/دامپ از CoinPaprika" },
 ];
 async function registerBotUI() {
   try {
@@ -1930,6 +2002,7 @@ function start() {
   pollOnce();
   setInterval(pollOnce, POLL_SECONDS * 1000);
   setInterval(pollWatchlistOnly, FAST_POLL_SECONDS * 1000);
+  setInterval(pollPaprikaFast, PAPRIKA_POLL_SECONDS * 1000);
   setInterval(pollTelegramCommands, 4000);
   setInterval(checkDailySummary, 60000);
 }
