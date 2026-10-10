@@ -106,7 +106,34 @@ const notifiedPump = new Map();
 const notifiedDump = new Map();
 const notifiedVolume = new Map();
 const prevExtremes = new Map(); // id -> {high, low}  (برای تشخیص شکست سقف/کف ۲۴ ساعته)
-const symbolToGeckoId = new Map(); // "BTC" -> "bitcoin"  (برای وصل‌کردن داده‌ی CoinPaprika به شناسه‌های CoinGecko)
+// جدول پایه‌ی نماد→شناسه برای کوین‌های معروف — مستقل از CoinGecko، تا رصد CoinPaprika
+// حتی وقتی سهمیه‌ی CoinGecko تموم شده یا هنوز هیچ‌وقت رصد اصلی اجرا نشده، کار کنه.
+const STATIC_SYMBOL_SEED = {
+  BTC: "bitcoin", ETH: "ethereum", USDT: "tether", BNB: "binancecoin", SOL: "solana",
+  USDC: "usd-coin", XRP: "ripple", DOGE: "dogecoin", TON: "the-open-network", ADA: "cardano",
+  TRX: "tron", AVAX: "avalanche-2", SHIB: "shiba-inu", DOT: "polkadot", LINK: "chainlink",
+  BCH: "bitcoin-cash", NEAR: "near", LTC: "litecoin", MATIC: "matic-network", POL: "polygon-ecosystem-token",
+  ICP: "internet-computer", UNI: "uniswap", DAI: "dai", LEO: "leo-token", ETC: "ethereum-classic",
+  XLM: "stellar", ATOM: "cosmos", OKB: "okb", FIL: "filecoin", APT: "aptos",
+  XMR: "monero", HBAR: "hedera-hashgraph", CRO: "crypto-com-chain", VET: "vechain", ARB: "arbitrum",
+  MKR: "maker", OP: "optimism", INJ: "injective-protocol", GRT: "the-graph", AAVE: "aave",
+  ALGO: "algorand", QNT: "quant-network", EGLD: "elrond-erd-2", SAND: "the-sandbox", XTZ: "tezos",
+  THETA: "theta-token", FTM: "fantom", MANA: "decentraland", AXS: "axie-infinity", RUNE: "thorchain",
+  FLOW: "flow", CHZ: "chiliz", EOS: "eos", KCS: "kucoin-shares", NEO: "neo",
+  KAVA: "kava", MINA: "mina-protocol", XEC: "ecash", CAKE: "pancakeswap-token", GALA: "gala",
+  SNX: "havven", LDO: "lido-dao", CRV: "curve-dao-token", BSV: "bitcoin-cash-sv", TWT: "trust-wallet-token",
+  ZEC: "zcash", DASH: "dash", ENJ: "enjincoin", COMP: "compound-governance-token", KSM: "kusama",
+  WAVES: "waves", BAT: "basic-attention-token", YFI: "yearn-finance", DYDX: "dydx", ONE: "harmony",
+  ZIL: "zilliqa", CELO: "celo", QTUM: "qtum", ANKR: "ankr", HOT: "holotoken",
+  IOTA: "iota", RVN: "ravencoin", SC: "siacoin", ZRX: "0x", OMG: "omisego",
+  SUSHI: "sushi", "1INCH": "1inch", REN: "republic-protocol", STORJ: "storj", SKL: "skale",
+  PEPE: "pepe", WIF: "dogwifcoin", BONK: "bonk", FLOKI: "floki", SUI: "sui",
+  SEI: "sei-network", TIA: "celestia", JUP: "jupiter-exchange-solana", PYTH: "pyth-network", STRK: "starknet",
+  RAY: "raydium", JTO: "jito-governance-token", W: "wormhole", ENA: "ethena", ONDO: "ondo-finance",
+  MOVR: "moonriver", GLMR: "moonbeam", ASTR: "astar", ROSE: "oasis-network", MASK: "mask-network",
+  IMX: "immutable-x", GMX: "gmx", BLUR: "blur", ORDI: "ordinals", BTW: "bitway",
+};
+const symbolToGeckoId = new Map(Object.entries(STATIC_SYMBOL_SEED)); // "BTC" -> "bitcoin"  (رصد CoinGecko بعداً می‌تونه گسترشش بده)
 const pivotLevels = new Map();     // id -> {levels:{P,R1,R2,R3,S1,S2,S3}, computedAt}
 const pivotCrossState = new Map(); // id -> {R1:"above"|"below", ...}
 let previousTopIds = new Set();  // برای تشخیص ورود تازه به لیست برتر
