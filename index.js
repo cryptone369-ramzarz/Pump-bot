@@ -218,7 +218,7 @@ function fmtNum(n) {
   if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";
   if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + "M";
   if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return n.toString();
+  return n.toFixed(2);
 }
 function fmtDateTime(ts) { return new Date(ts).toLocaleString("fa-IR", { timeZone: TIMEZONE }); }
 function fmtTimeOnly(ts) { return new Date(ts).toLocaleTimeString("fa-IR", { timeZone: TIMEZONE }); }
@@ -815,17 +815,28 @@ async function pollPaprikaFast() {
   const now = Date.now();
   try {
     const tickers = await fetchPaprikaTickers();
-    const updatedIds = new Set();
+    // چندتا کوین مختلف می‌تونن یه نماد مشترک داشته باشن (مثلاً یه توکن گمنام که اسمش رو از XRP برداشته).
+    // برای هر نماد، فقط اونی که رتبه‌ی بازارش بهتره (عدد کوچیک‌تر) رو نگه می‌داریم، نه هرکدوم که اول بیاد.
+    const bestBySymbol = new Map(); // "XRP" -> {ticker, rank}
     for (const t of tickers) {
       const sym = (t.symbol || "").toUpperCase();
-      const id = symbolToGeckoId.get(sym);
-      if (!id) continue; // کوینی که روی CoinGecko شناسایی نشده، فعلاً نادیده گرفته می‌شه
+      if (!sym || !symbolToGeckoId.has(sym)) continue;
       const q = t.quotes && t.quotes.USD;
       if (!q || !q.price) continue;
+      const rank = typeof t.rank === "number" && t.rank > 0 ? t.rank : Infinity;
+      const cur = bestBySymbol.get(sym);
+      if (!cur || rank < cur.rank) bestBySymbol.set(sym, { ticker: t, rank });
+    }
+    const updatedIds = new Set();
+    for (const [sym, { ticker: t, rank }] of bestBySymbol.entries()) {
+      const id = symbolToGeckoId.get(sym);
+      const q = t.quotes.USD;
       const prevMeta = meta.get(id) || { name: t.name, symbol: t.symbol };
       meta.set(id, Object.assign({}, prevMeta, {
         volume: q.volume_24h != null ? q.volume_24h : prevMeta.volume,
         change24h: q.percent_change_24h != null ? q.percent_change_24h : prevMeta.change24h,
+        rank: prevMeta.rank != null ? prevMeta.rank : (rank !== Infinity ? rank : prevMeta.rank),
+        marketCap: prevMeta.marketCap != null ? prevMeta.marketCap : (q.market_cap != null ? q.market_cap : prevMeta.marketCap),
       }));
       pushPrice(id, q.price, now);
       updatedIds.add(id);
