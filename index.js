@@ -775,32 +775,85 @@ async function pollOnce() {
 async function pollWatchlistOnly() {
   if (!state.fastPollEnabled) return;
   if (state.paused) return;
-  if (apiBudgetExceeded()) return;
   const wanted = new Set(state.priceAlerts.map((a) => a.coinId));
   state.watchlist.forEach((w) => wanted.add(w.id));
   if (!wanted.size) return; // چیزی برای رصد سریع نیست، لازم نیست درخواستی بزنیم
   const now = Date.now();
-  try {
-    const ids = Array.from(wanted);
-    const coins = await fetchMarketsByIds(ids);
-    const updatedIds = new Set();
-    for (const c of coins) {
-      if (!c.current_price) continue;
-      meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
-      pushPrice(c.id, c.current_price, now);
-      updateBaselines(c, now);
-      checkBreakout(c, now, true);
-      updatedIds.add(c.id);
+  let anyUpdated = false;
+
+  // تلاش اول: CoinGecko — کامل‌تره (رتبه، ارزش‌بازار، سقف/کف برای مقاومت/حمایت و شکست)
+  if (!apiBudgetExceeded()) {
+    try {
+      const ids = Array.from(wanted);
+      const coins = await fetchMarketsByIds(ids);
+      for (const c of coins) {
+        if (!c.current_price) continue;
+        meta.set(c.id, { name: c.name, symbol: c.symbol, volume: c.total_volume || 0, rank: c.market_cap_rank, marketCap: c.market_cap || 0, change24h: c.price_change_percentage_24h });
+        pushPrice(c.id, c.current_price, now);
+        updateBaselines(c, now);
+        checkBreakout(c, now, true);
+        anyUpdated = true;
+      }
+    } catch (err) {
+      if (err.message === "rate_limited_429") console.error("محدودیت نرخ CoinGecko (429) در رصد سریع لیست ویژه.");
+      else console.error("خطا در رصد سریع لیست ویژه (CoinGecko):", err.message);
     }
-    await evaluate(now, updatedIds);
+  }
+
+  // تلاش دوم: CoinPaprika — برای کوین‌هایی که توی همین چرخه از CoinGecko به‌روز نشدن
+  // (چه چون سهمیه‌ی CoinGecko تموم شده، چه چون خطا خورد). فقط قیمت رو تازه نگه می‌داره؛
+  // سقف/کف و مقاومت/حمایت نیاز به CoinGecko دارن و با این مسیر به‌روز نمی‌شن.
+  const stillNeeded = Array.from(wanted).filter((id) => {
+    const arr = history.get(id);
+    return !(arr && arr.length && arr[arr.length - 1].t === now);
+  });
+  if (stillNeeded.length && state.paprikaEnabled && !paprikaBudgetExceeded()) {
+    const wantedSymbols = new Set();
+    const idToSymbol = new Map();
+    for (const id of stillNeeded) {
+      const entry = state.watchlist.find((w) => w.id === id) || state.priceAlerts.find((a) => a.coinId === id);
+      const sym = entry ? entry.symbol.toUpperCase() : null;
+      if (sym) { wantedSymbols.add(sym); idToSymbol.set(id, sym); }
+    }
+    if (wantedSymbols.size) {
+      try {
+        const tickers = await fetchPaprikaTickers();
+        const bestBySymbol = new Map(); // همون منطق جلوگیری از تداخل نمادهای تکراری
+        for (const t of tickers) {
+          const sym = (t.symbol || "").toUpperCase();
+          if (!wantedSymbols.has(sym)) continue;
+          const q = t.quotes && t.quotes.USD;
+          if (!q || !q.price) continue;
+          const rank = typeof t.rank === "number" && t.rank > 0 ? t.rank : Infinity;
+          const cur = bestBySymbol.get(sym);
+          if (!cur || rank < cur.rank) bestBySymbol.set(sym, { ticker: t, rank });
+        }
+        for (const id of stillNeeded) {
+          const sym = idToSymbol.get(id);
+          const best = sym && bestBySymbol.get(sym);
+          if (!best) continue;
+          const q = best.ticker.quotes.USD;
+          const prevMeta = meta.get(id) || { name: best.ticker.name, symbol: best.ticker.symbol };
+          meta.set(id, Object.assign({}, prevMeta, {
+            volume: q.volume_24h != null ? q.volume_24h : prevMeta.volume,
+            change24h: q.percent_change_24h != null ? q.percent_change_24h : prevMeta.change24h,
+          }));
+          pushPrice(id, q.price, now);
+          anyUpdated = true;
+        }
+      } catch (err) {
+        if (err.message !== "rate_limited_429") console.error("خطا در رصد سریع لیست ویژه (CoinPaprika):", err.message);
+      }
+    }
+  }
+
+  if (anyUpdated) {
+    await evaluate(now, wanted);
     for (const w of state.watchlist) {
       const arr = history.get(w.id);
       if (arr && arr.length) await checkPivotCrossings(w.id, arr[arr.length - 1].p, w.symbol, w.name);
     }
     checkPriceAlerts(now);
-  } catch (err) {
-    if (err.message === "rate_limited_429") console.error("محدودیت نرخ CoinGecko (429) در رصد سریع لیست ویژه.");
-    else console.error("خطا در رصد سریع لیست ویژه:", err.message);
   }
 }
 
